@@ -154,6 +154,8 @@ def update_step(
     error_message: str | None = None,
     started: bool = False,
     finished: bool = False,
+    started_at_value: str | None = None,
+    finished_at_value: str | None = None,
     session_id: int | None = None,
     dataset: str | None = None,
 ) -> dict:
@@ -170,9 +172,9 @@ def update_step(
     elif status in {"running", "done"}:
         step["error_message"] = None
     if started and not step.get("started_at"):
-        step["started_at"] = now_iso()
-    if finished:
-        step["finished_at"] = now_iso()
+        step["started_at"] = started_at_value or now_iso()
+    if finished and not step.get("finished_at"):
+        step["finished_at"] = finished_at_value or now_iso()
     return save_state(subject_id, session_label, state)
 
 

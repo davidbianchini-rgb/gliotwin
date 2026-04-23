@@ -1543,7 +1543,7 @@ GlioTwin.register('browser', async (app) => {
 
       _S.selectedSignalLabel = (_S.signalOptions.labels || []).includes(_S.selectedSignalLabel)
         ? _S.selectedSignalLabel
-        : (allStructs[0]?.label || _S.signalOptions.labels[0] || '');
+        : (_S.allStructsRaw[0]?.label || _S.signalOptions.labels[0] || '');
       _S.selectedSignalSequence = _S.selectedSignalSequence && (sesDetail.sequences || []).some((seq) => seq.sequence_type === _S.selectedSignalSequence)
         ? _S.selectedSignalSequence
         : ((sesDetail.sequences || []).find((seq) => seq.sequence_type === 'T1ce')?.sequence_type || _S.signalOptions.sequenceTypes[0] || '');

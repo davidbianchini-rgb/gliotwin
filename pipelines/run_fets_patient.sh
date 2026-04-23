@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # run_fets_patient.sh
-# Pipeline FeTS standalone - preprocessing + segmentazione tumorale
+# Pipeline FeTS standalone - preprocessing e, opzionalmente, segmentazione tumorale
 # Bypassa completamente MedPerf, niente login, niente dataset registration
 #
 # Uso:
@@ -33,11 +33,12 @@ HOST_PIPELINES_DIR="/home/irst/gliotwin/pipelines"
 CONTAINER_PIPELINES_DIR="/gliotwin_pipelines"
 
 usage() {
-  echo "Uso: $0 --paziente PAZ_ID --input /path/input --output /path/output [--gpu 0] [--no-gpu]"
+  echo "Uso: $0 --paziente PAZ_ID --input /path/input --output /path/output [--mode brain|all] [--gpu 0] [--no-gpu]"
   echo ""
   echo "  --paziente   ID paziente (deve corrispondere alla cartella in --input)"
   echo "  --input      Cartella radice contenente la cartella paziente"
   echo "  --output     Cartella dove salvare i risultati"
+  echo "  --mode       brain = solo data preparation, tumor = solo segmentazione, all = brain + tumor (default: all)"
   echo "  --gpu N      Numero GPU da usare per la fase tumorale (default: 0)"
   echo "  --no-gpu     Esegui anche la fase tumorale su CPU"
   exit 1
@@ -48,12 +49,14 @@ INPUT_BASE=""
 OUTPUT_BASE=""
 GPU_ID="0"
 USE_GPU=true
+RUN_MODE="all"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --paziente) PAZ_ID="$2"; shift 2 ;;
     --input) INPUT_BASE="$2"; shift 2 ;;
     --output) OUTPUT_BASE="$2"; shift 2 ;;
+    --mode) RUN_MODE="$2"; shift 2 ;;
     --gpu) GPU_ID="$2"; shift 2 ;;
     --no-gpu) USE_GPU=false; shift ;;
     *) echo "Argomento sconosciuto: $1"; usage ;;
@@ -61,6 +64,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -z "$PAZ_ID" || -z "$INPUT_BASE" || -z "$OUTPUT_BASE" ]] && usage
+[[ "$RUN_MODE" != "brain" && "$RUN_MODE" != "tumor" && "$RUN_MODE" != "all" ]] && usage
 
 if [[ ! -f "$SIF" ]]; then
   echo "ERRORE: Container non trovato: $SIF"
@@ -93,7 +97,11 @@ if [[ $MISSING -eq 1 ]]; then
 fi
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-OUT_DIR="${OUTPUT_BASE}/${PAZ_ID}_${TIMESTAMP}"
+if [[ "$RUN_MODE" = "tumor" && -d "$OUTPUT_BASE/output" ]]; then
+  OUT_DIR="$OUTPUT_BASE"
+else
+  OUT_DIR="${OUTPUT_BASE}/${PAZ_ID}_${TIMESTAMP}"
+fi
 OUT_PREPARED="${OUT_DIR}/output"
 OUT_LABELS="${OUT_DIR}/output_labels"
 OUT_METADATA="${OUT_DIR}/metadata"
@@ -141,15 +149,18 @@ echo "Log: $LOG_FILE"
 echo ""
 
 set +e
-apptainer exec \
-  "${BIND_ARGS[@]}" \
-  "$SIF" \
-  "${BASE_CMD[@]}" \
-  "--mode=brain" \
-  2>&1 | tee "$LOG_FILE"
-PHASE1_EXIT=${PIPESTATUS[0]}
+PHASE1_EXIT=0
+if [[ "$RUN_MODE" != "tumor" ]]; then
+  apptainer exec \
+    "${BIND_ARGS[@]}" \
+    "$SIF" \
+    "${BASE_CMD[@]}" \
+    "--mode=brain" \
+    2>&1 | tee "$LOG_FILE"
+  PHASE1_EXIT=${PIPESTATUS[0]}
+fi
 
-if [[ $PHASE1_EXIT -eq 0 ]]; then
+if [[ $PHASE1_EXIT -eq 0 && ( "$RUN_MODE" = "all" || "$RUN_MODE" = "tumor" ) ]]; then
   if [[ "$USE_GPU" = true ]]; then
     env "APPTAINERENV_CUDA_VISIBLE_DEVICES=${GPU_ID}" apptainer exec \
       --nv \

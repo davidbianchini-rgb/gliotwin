@@ -4,6 +4,7 @@ const WorkspaceView = {
     caseData: null,
     system: null,
     selectedJobId: null,
+    focusedSessionId: null,
     selectedSessions: {},
     filters: {
       status: 'active',
@@ -29,6 +30,12 @@ const WorkspaceView = {
     ]);
     this.state.overview = overview;
     this.state.system = system;
+    if (!this.state.focusedSessionId) {
+      this.state.focusedSessionId = overview.current_job?.session_id || overview.running_jobs?.[0]?.session_id || overview.queued_jobs?.[0]?.session_id || overview.sessions?.[0]?.session_id || null;
+    }
+    if (this.state.focusedSessionId) {
+      await this.loadCase(this.state.focusedSessionId);
+    }
     this.state.loading = false;
   },
 
@@ -39,12 +46,21 @@ const WorkspaceView = {
     ]);
     this.state.overview = overview;
     this.state.system = system;
+    const activeSessionId = overview.current_job?.session_id || overview.running_jobs?.[0]?.session_id || overview.queued_jobs?.[0]?.session_id || null;
+    if (activeSessionId) {
+      this.state.focusedSessionId = activeSessionId;
+    }
+    if (this.state.focusedSessionId) {
+      await this.refreshCase(this.state.focusedSessionId);
+    }
   },
 
   async loadCase(sessionId) {
     this.state.loading = true;
+    this.state.focusedSessionId = parseInt(sessionId, 10);
     this.state.caseData = await GlioTwin.fetch(`/api/workspace/${sessionId}`);
-    this.state.selectedJobId = this.state.caseData.jobs?.[0]?.id || null;
+    const preferredJob = (this.state.caseData.jobs || []).find(job => job.status === 'running' || job.status === 'queued') || null;
+    this.state.selectedJobId = preferredJob?.id || null;
     if (this.state.selectedJobId) {
       const log = await GlioTwin.fetch(`/api/processing/jobs/${this.state.selectedJobId}/log?tail=16000`);
       this.state.logText = log.text || '';
@@ -55,10 +71,12 @@ const WorkspaceView = {
   },
 
   async refreshCase(sessionId) {
+    this.state.focusedSessionId = parseInt(sessionId, 10);
     this.state.caseData = await GlioTwin.fetch(`/api/workspace/${sessionId}`);
     const jobs = this.state.caseData.jobs || [];
-    if (!jobs.some(job => job.id === this.state.selectedJobId)) {
-      this.state.selectedJobId = jobs[0]?.id || null;
+    const preferredJob = jobs.find(job => job.status === 'running' || job.status === 'queued') || null;
+    if (!jobs.some(job => job.id === this.state.selectedJobId) || preferredJob?.id !== this.state.selectedJobId) {
+      this.state.selectedJobId = preferredJob?.id || null;
     }
     if (this.state.selectedJobId) {
       const log = await GlioTwin.fetch(`/api/processing/jobs/${this.state.selectedJobId}/log?tail=16000`);
@@ -120,27 +138,185 @@ const WorkspaceView = {
     return `<span class="badge ${cls}">${status}</span>`;
   },
 
-  renderPipelineSummary(item) {
+  compactMachineItems() {
+    const s = this.state.system || {};
+    const mem = s.memory || {};
+    const gpu = (s.gpus || [])[0];
+    return [
+      ['CPU', s.cpu_percent != null ? `${s.cpu_percent}%` : '—'],
+      ['RAM', mem.used_percent != null ? `${mem.used_percent}%` : '—'],
+      ['Free', mem.available_mb != null ? `${mem.available_mb} MB` : '—'],
+      ['GPU', gpu ? `${gpu.utilization_gpu}%` : '—'],
+      ['VRAM', gpu ? `${gpu.memory_used_mb}/${gpu.memory_total_mb} MB` : '—'],
+    ];
+  },
+
+  elapsedLabel(job) {
+    if (!job?.started_at) return '—';
+    const start = new Date(job.started_at);
+    const end = job.finished_at ? new Date(job.finished_at) : new Date();
+    const seconds = Math.max(0, Math.round((end - start) / 1000));
+    return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  },
+
+  _parseTime(value) {
+    if (!value) return null;
+    const dt = new Date(value);
+    return Number.isNaN(dt.getTime()) ? null : dt;
+  },
+
+  _fmtClock(value) {
+    const dt = this._parseTime(value);
+    if (!dt) return '—';
+    return dt.toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  },
+
+  _fmtDuration(startedAt, finishedAt) {
+    const start = this._parseTime(startedAt);
+    if (!start) return '—';
+    const end = this._parseTime(finishedAt) || new Date();
+    const seconds = Math.max(0, Math.round((end - start) / 1000));
+    return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  },
+
+  currentStepLabel(job) {
+    const stage = job?.progress_stage || '';
+    const map = {
+      queued: 'In coda',
+      preparing_input: 'Preparazione input',
+      running_fets: 'Avvio preprocessing',
+      initial_validation: 'Validazione input',
+      nifti_conversion: 'Conversione NIfTI',
+      brain_extraction: 'Brain extraction',
+      brain_queue: 'Brain extraction',
+      brain_inference: 'Brain extraction',
+      completed: 'Preprocessing completato',
+      failed: 'Fallito',
+      cancelled: 'Fermato',
+    };
+    return map[stage] || job?.progress_label || job?.status || 'In attesa';
+  },
+
+  clearPreprocessingStateLocally(sessionId) {
+    const clearSteps = (steps = []) => steps.map(step => (
+      ['initial_validation', 'nifti_conversion', 'brain_extraction', 'tumor_segmentation'].includes(step.key)
+        ? { ...step, status: 'pending', output_path: null, error_message: null, started_at: null, finished_at: null }
+        : step
+    ));
+
+    if (this.state.caseData?.session?.id === sessionId) {
+      this.state.caseData = {
+        ...this.state.caseData,
+        pipeline_state: {
+          ...this.state.caseData.pipeline_state,
+          steps: clearSteps(this.state.caseData.pipeline_state?.steps || []),
+        },
+      };
+    }
+  },
+
+  phaseIndicators(data, activeJob = null) {
+    const steps = data.pipeline_state?.steps || [];
+    const byKey = Object.fromEntries(steps.map(step => [step.key, step]));
+    const groupInfo = (keys, fallbackLabel, fallbackDetail, opts = {}) => {
+      const group = keys.map(key => byKey[key]).filter(Boolean);
+      const statuses = group.map(step => step.status);
+      let status = 'waiting';
+      if (statuses.some(s => s === 'failed')) status = 'blocked';
+      else if (statuses.some(s => s === 'running')) status = 'running';
+      else if (group.length && group.every(step => step.status === 'done')) status = 'ok';
+      else if (statuses.some(s => s === 'done')) status = 'partial';
+      else if (statuses.some(s => s === 'pending')) status = 'waiting';
+      let started = group.map(step => step.started_at).filter(Boolean).sort()[0] || null;
+      const finishedValues = group.map(step => step.finished_at).filter(Boolean).sort();
+      const finished = status === 'ok' ? (finishedValues[finishedValues.length - 1] || null) : null;
+      let visibleStarted = started;
+      let visibleFinished = finished;
+      if (!activeJob && status !== 'ok') {
+        visibleStarted = null;
+        visibleFinished = null;
+      }
+      return {
+        status,
+        started_at: visibleStarted,
+        finished_at: visibleFinished,
+        duration: this._fmtDuration(visibleStarted, visibleFinished) || '—',
+        detail: fallbackDetail,
+        label: fallbackLabel,
+        showTimes: opts.showTimes !== false,
+      };
+    };
+
+    const seqs = data.sequences || [];
+    const coreWithRaw = seqs.filter(s => ['T1', 'T1ce', 'T2', 'FLAIR'].includes(s.sequence_type) && s.raw_path);
+    const outputReady = seqs.filter(s => ['T1', 'T1ce', 'T2', 'FLAIR'].includes(s.sequence_type) && s.processed_path).length >= 4;
+
+    const items = [
+      {
+        label: 'Serie core',
+        detail: coreWithRaw.length
+          ? `${coreWithRaw.length} serie core (${coreWithRaw.map(s => s.sequence_type).join(', ')})`
+          : 'Serie core non complete',
+        status: coreWithRaw.length >= 4 ? 'ok' : 'blocked',
+        started_at: null,
+        finished_at: null,
+        duration: '—',
+        showTimes: false,
+      },
+      groupInfo(['initial_validation'], 'Validazione input', 'Controllo tecnico dell input FeTS'),
+      groupInfo(['nifti_conversion'], 'NIfTI core', 'Disponibilita dei volumi NIfTI delle serie core'),
+      groupInfo(['brain_extraction'], 'Brain mask', 'Estrazione del parenchima cerebrale'),
+      {
+        label: 'Output pronti',
+        detail: outputReady ? 'Volumi preprocessati disponibili' : 'Strutture non ancora disponibili',
+        status: outputReady ? 'ok' : 'waiting',
+        started_at: null,
+        finished_at: null,
+        duration: '—',
+        showTimes: false,
+      },
+    ];
+
+    let previousFinishedAt = null;
+    return items.map(item => {
+      if (item.showTimes === false) return item;
+      let startedAt = item.started_at;
+      let finishedAt = item.finished_at;
+      if (previousFinishedAt && (startedAt || finishedAt)) {
+        startedAt = previousFinishedAt;
+      }
+      if (finishedAt && startedAt) {
+        const startMs = this._parseTime(startedAt)?.getTime();
+        const endMs = this._parseTime(finishedAt)?.getTime();
+        if (startMs != null && endMs != null && endMs < startMs) {
+          finishedAt = startedAt;
+        }
+      }
+      if (finishedAt) {
+        previousFinishedAt = finishedAt;
+      }
+      return {
+        ...item,
+        started_at: startedAt,
+        finished_at: finishedAt,
+        duration: this._fmtDuration(startedAt, finishedAt),
+      };
+    });
+  },
+
+  renderPreprocSummary(item) {
     const summary = item.pipeline_state?.steps || [];
-    const seqs = item.sequences || [];
-    const computed = item.computed_structures || [];
-
-    // derive highest completed phase for compact display
     const stepDone  = key => summary.find(s => s.key === key)?.status === 'done';
-    const stepFailed= key => summary.find(s => s.key === key)?.status === 'failed';
-    const hasFets   = computed.some(s => s.model_name && s.model_name !== 'rh-glioseg-v3');
-    const hasRhg    = computed.some(s => s.model_name === 'rh-glioseg-v3');
-
-    if (stepFailed('tumor_segmentation'))
-      return `<span class="workspace-step-inline failed">Segmentazione fallita</span>`;
-    if (hasFets || hasRhg)
-      return `<span class="workspace-step-inline done">Segmentazione completata</span>`;
-    if (stepDone('brain_extraction'))
-      return `<span class="workspace-step-inline done">Preprocessing completato</span>`;
-    if (stepDone('nifti_conversion'))
-      return `<span class="workspace-step-inline done">NIfTI convertito</span>`;
-    if (seqs.some(s => s.raw_path))
-      return `<span class="workspace-step-inline done">Import completato</span>`;
+    const stepRun   = key => summary.find(s => s.key === key)?.status === 'running';
+    const stepFail  = key => summary.find(s => s.key === key)?.status === 'failed';
+    if (stepFail('initial_validation') || stepFail('nifti_conversion') || stepFail('brain_extraction')) {
+      return `<span class="workspace-step-inline failed">Preprocessing fallito</span>`;
+    }
+    if (stepDone('brain_extraction')) return `<span class="workspace-step-inline done">Preprocessing completato</span>`;
+    if (stepRun('initial_validation') || stepRun('nifti_conversion') || stepRun('brain_extraction')) {
+      return `<span class="workspace-step-inline running">Preprocessing in corso</span>`;
+    }
+    if (item.sequences?.some(seq => seq.raw_path)) return `<span class="workspace-step-inline pending">Pronto a partire</span>`;
     return `<span class="workspace-step-inline pending">Nessuna attività</span>`;
   },
 
@@ -159,9 +335,6 @@ const WorkspaceView = {
     const jobRunning   = jobs.some(j => j.status === 'running');
 
     const nativeStructs = computed.filter(s => s.reference_space === 'native');
-    const fetsStructs   = computed.filter(s => s.model_name && s.model_name !== 'rh-glioseg-v3');
-    const rhgStructs    = computed.filter(s => s.model_name === 'rh-glioseg-v3');
-
     // IMPORT
     const importOk = coreWithRaw.length >= 2;
     const importStatus = importOk ? 'ok' : 'blocked';
@@ -187,53 +360,15 @@ const WorkspaceView = {
       !importOk                   ? 'Richiede import completato'           :
                                     'Non avviato — usa Queue nella lista sessioni';
 
-    // SEGMENTATION — FeTS
-    const segStep    = stepStatus('tumor_segmentation');
-    const fetsStatus =
-      fetsStructs.length > 0   ? 'ok'      :
-      segStep === 'failed'      ? 'blocked' :
-      (jobRunning && segStep === 'running') ? 'running' :
-      preprocOk                 ? 'pending' : 'waiting';
-    const fetsDetail =
-      fetsStatus === 'ok'      ? `${fetsStructs.length} strutture FeTS` :
-      fetsStatus === 'blocked' ? `Errore: ${stepError('tumor_segmentation')}` :
-      fetsStatus === 'running' ? 'Segmentazione FeTS in esecuzione…'     :
-      fetsStatus === 'pending' ? 'Preprocessing pronto — avvia dalla lista sessioni' :
-                                 'Richiede preprocessing completato';
-
-    // SEGMENTATION — rh-GlioSeg
-    const rhgStatus =
-      rhgStructs.length > 0 ? 'ok'     :
-      preprocOk              ? 'pending': 'waiting';
-    const rhgDetail =
-      rhgStatus === 'ok'     ? `${rhgStructs.length} strutture rh-GlioSeg`          :
-      rhgStatus === 'pending'? 'Avviabile dalla view Segmentation'                  :
-                               'Richiede preprocessing completato';
-
-    // ANALYSIS
-    const analysisStatus = nativeStructs.length > 0 ? 'ok' : 'waiting';
-    const analysisDetail = nativeStructs.length > 0
-      ? `${nativeStructs.length} strutture in spazio nativo — metriche calcolabili`
-      : 'Richiede almeno una struttura completata';
-
-    // EXPORT
-    const exportStatus = nativeStructs.length > 0 ? 'ok' : 'waiting';
-    const exportDetail = nativeStructs.length > 0
-      ? 'Strutture in spazio nativo disponibili per RTSTRUCT'
-      : 'Richiede strutture in spazio nativo';
-
     return [
       { phase: 'IMPORT',        label: 'Serie core riconosciute',  status: importStatus,   detail: importDetail   },
       { phase: 'PREPROCESSING', label: 'Preprocessing',            status: preprocStatus,  detail: preprocDetail  },
-      { phase: 'SEGMENTATION',  label: 'Segmentazione FeTS',       status: fetsStatus,     detail: fetsDetail     },
-      { phase: 'SEGMENTATION',  label: 'Segmentazione rh-GlioSeg', status: rhgStatus,      detail: rhgDetail      },
-      { phase: 'ANALYSIS',      label: 'Metriche disponibili',     status: analysisStatus, detail: analysisDetail },
-      { phase: 'EXPORT',        label: 'Export RTSTRUCT',          status: exportStatus,   detail: exportDetail   },
+      { phase: 'PREPROCESSING', label: 'Output nativi disponibili', status: nativeStructs.length > 0 ? 'ok' : 'waiting', detail: nativeStructs.length > 0 ? `${nativeStructs.length} strutture in spazio nativo` : 'Strutture non ancora disponibili' },
     ];
   },
 
   renderChecklistCard(data) {
-    const items = this._buildChecklist(data);
+    const items = this.phaseIndicators(data);
     const icons = { ok: '✓', blocked: '✗', running: '◌', partial: '◑', pending: '○', waiting: '·' };
     const PHASE_COLORS = {
       IMPORT:        'var(--accent)',
@@ -265,6 +400,29 @@ const WorkspaceView = {
       <div class="card cl-card">
         <div class="card-title">Checklist di fase</div>
         <div class="cl-list">${rows}</div>
+      </div>
+    `;
+  },
+
+  renderProcessingSummaryCard(data, activeJob, selectedJob) {
+    const items = this._buildChecklist(data);
+    const importItem = items.find(item => item.label === 'Serie core riconosciute');
+    const prepItem = items.find(item => item.label === 'Preprocessing');
+    const displayJob = activeJob && activeJob.session_id === data.session.id ? activeJob : selectedJob;
+    return `
+      <div class="workspace-processing-summary">
+        <div class="workspace-processing-row">
+          <span class="workspace-processing-label">Import</span>
+          <span class="workspace-processing-value">${importItem?.detail || '—'}</span>
+        </div>
+        <div class="workspace-processing-row">
+          <span class="workspace-processing-label">Preprocessing</span>
+          <span class="workspace-processing-value">${prepItem?.detail || '—'}</span>
+        </div>
+        <div class="workspace-processing-row">
+          <span class="workspace-processing-label">Step corrente</span>
+          <span class="workspace-processing-value">${displayJob?.progress_label || displayJob?.progress_stage || displayJob?.status || 'ready'}</span>
+        </div>
       </div>
     `;
   },
@@ -306,52 +464,14 @@ const WorkspaceView = {
   },
 
   renderSystemCard() {
-    const s = this.state.system || {};
-    const mem = s.memory || {};
-    const gpu = (s.gpus || [])[0];
     return `
-      <div class="card">
+      <div class="card workspace-system-card">
         <div class="card-title">Machine Status</div>
         <div class="workspace-metrics">
-          <div class="workspace-metric"><span>CPU</span><strong>${s.cpu_percent != null ? s.cpu_percent + '%' : '—'}</strong></div>
-          <div class="workspace-metric"><span>Load</span><strong>${s.loadavg ? s.loadavg.join(' / ') : '—'}</strong></div>
-          <div class="workspace-metric"><span>RAM</span><strong>${mem.used_percent != null ? mem.used_percent + '%' : '—'}</strong></div>
-          <div class="workspace-metric"><span>Avail RAM</span><strong>${mem.available_mb != null ? mem.available_mb + ' MB' : '—'}</strong></div>
-          <div class="workspace-metric"><span>GPU</span><strong>${gpu ? gpu.utilization_gpu + '%' : '—'}</strong></div>
-          <div class="workspace-metric"><span>GPU RAM</span><strong>${gpu ? `${gpu.memory_used_mb}/${gpu.memory_total_mb} MB` : '—'}</strong></div>
+          ${this.compactMachineItems().map(([label, value]) => `
+            <div class="workspace-metric"><span>${label}</span><strong>${value}</strong></div>
+          `).join('')}
         </div>
-      </div>
-    `;
-  },
-
-  renderCurrentJobCard() {
-    const overview = this.state.overview || {};
-    const current = overview.current_job || null;
-    const elapsed = current?.elapsed_seconds != null
-      ? `${Math.floor(current.elapsed_seconds / 60)}m ${current.elapsed_seconds % 60}s`
-      : '—';
-    return `
-      <div class="card">
-        <div class="card-title">Current Job</div>
-        ${current ? `
-          <div class="workspace-current-job">
-            <div class="workspace-current-main">${GlioTwin.patientPrimary(current)} · ${current.session_label}</div>
-            <div class="workspace-current-sub">Job #${current.id} · ${current.progress_label || current.progress_stage || current.status}</div>
-            ${GlioTwin.state.showSensitive && GlioTwin.sessionMeta(current) ? `<div class="workspace-current-sub">${GlioTwin.sessionMeta(current)}</div>` : ''}
-            <div class="workspace-current-sub">Status: ${current.status}</div>
-            <div class="workspace-current-sub">Elapsed: ${elapsed}</div>
-            <div class="workspace-current-actions">
-              <button class="btn workspace-cancel-job" data-job-id="${current.id}">Stop Current Job</button>
-              <button class="btn workspace-stop-all">Stop All</button>
-              <button class="btn btn-linklike workspace-open-case" data-session-id="${current.session_id}">Open Case</button>
-            </div>
-          </div>
-        ` : `
-          <div class="workspace-empty-block">No job running.</div>
-          <div class="workspace-current-actions" style="margin-top:10px">
-            <button class="btn workspace-stop-all">Stop All</button>
-          </div>
-        `}
       </div>
     `;
   },
@@ -375,7 +495,7 @@ const WorkspaceView = {
         <td><div class="import-core-strip">${coreSummary}</div></td>
         <td>
           ${item.latest_job ? `#${item.latest_job.id} · ${item.latest_job.progress_label || item.latest_job.progress_stage || item.latest_job.status}` : '—'}
-          <div>${this.renderPipelineSummary(item)}</div>
+          <div>${this.renderPreprocSummary(item)}</div>
         </td>
         <td>
           <button class="btn btn-linklike workspace-open-case" data-session-id="${item.session_id}">Open</button>
@@ -400,6 +520,51 @@ const WorkspaceView = {
     `;
   },
 
+  renderProcessingCaseCard() {
+    const data = this.state.caseData;
+    if (!data) {
+      return `
+        <div class="card">
+          <div class="card-title">Processing Case</div>
+          <div class="workspace-empty-block">No case selected.</div>
+        </div>
+      `;
+    }
+    const selectedJob = (data.jobs || []).find(job => job.id === this.state.selectedJobId) || data.jobs?.[0] || null;
+    const activeJob = (data.jobs || []).find(job => job.status === 'running' || job.status === 'queued') || null;
+    const items = this.phaseIndicators(data, activeJob);
+    return `
+      <div class="card">
+        <div class="card-title">Processing Case</div>
+        <div class="workspace-current-job">
+          <div class="workspace-current-main">${GlioTwin.patientPrimary(data.subject)} · ${data.session.session_label}</div>
+          <div class="workspace-current-sub">Ora: ${this.currentStepLabel(activeJob)}</div>
+        </div>
+        <div class="workspace-log-meta">Attivita monitorate del preprocessing: possono sovrapporsi, non sono fasi seriali.</div>
+        <div class="workspace-phase-strip">
+          ${items.map(item => `
+            <div class="workspace-phase-dot phase-${item.status}" title="${item.label}: ${item.detail}">
+              <span class="workspace-phase-bullet"></span>
+              <span class="workspace-phase-text">
+                <strong>${item.label}</strong>
+                <small>
+                  ${item.detail}
+                  ${item.showTimes !== false ? ` · Inizio: ${this._fmtClock(item.started_at)} · Fine: ${this._fmtClock(item.finished_at)} · Durata: ${item.duration || '—'}` : ''}
+                </small>
+              </span>
+            </div>
+          `).join('')}
+        </div>
+        <div class="workspace-side-stack">
+          <div class="workspace-log-wrap">
+            <div class="workspace-log-meta">${selectedJob ? `Job #${selectedJob.id} · ${selectedJob.status} · ${selectedJob.progress_label || selectedJob.progress_stage || '—'}` : 'No job selected'}</div>
+            <pre class="workspace-log">${this.state.logText || 'No log yet.'}</pre>
+          </div>
+        </div>
+      </div>
+    `;
+  },
+
   renderCase(app, arg) {
     const data = this.state.caseData;
     if (!data) {
@@ -419,30 +584,19 @@ const WorkspaceView = {
           </div>
           <div class="workspace-header-actions">
             <button class="btn" id="workspace-back">Back to Queue</button>
+            <button class="btn workspace-stop-all">Stop All</button>
             <button class="btn" id="workspace-open-viewer" ${!data.computed_structures.length ? 'disabled' : ''}>Open Viewer</button>
           </div>
         </div>
         <div class="workspace-grid">
           <section class="workspace-main">
-            ${this.renderChecklistCard(data)}
-            <div class="card">
-              <div class="card-title">Pipeline Steps</div>
-              <div class="workspace-step-grid">
-                ${data.steps.map(step => `
-                  <div class="workspace-step-card">
-                    <div class="workspace-step-title">${step.label}</div>
-                    <span class="workspace-step-status workspace-step-${step.status}">${step.status}</span>
-                  </div>
-                `).join('')}
-              </div>
-            </div>
+            ${this.renderProcessingSummaryCard(data, selectedJob, selectedJob)}
             <div class="card">
               <div class="card-title">Computed Structures</div>
               ${data.computed_structures.length ? data.computed_structures.map(item => `
                 <div class="workspace-struct-row"><span>${item.label}</span><span>${GlioTwin.fmtVol(item.volume_ml)}</span></div>
               `).join('') : `<div class="workspace-empty-block">No computed structures yet.</div>`}
             </div>
-            ${this.renderPipelineCard(data.pipeline_state)}
           </section>
           <aside class="workspace-side">
             <div class="card">
@@ -494,12 +648,11 @@ const WorkspaceView = {
         <div class="workspace-header">
           <div>
             <div class="import-title">Preprocessing</div>
-            <div class="import-subtitle">Gestione batch delle sessioni importate: pipeline state, job FeTS, avanzamento per stato. La coda è seriale: un job alla volta.</div>
+            <div class="import-subtitle">Seleziona un caso, mettilo in coda e segui a destra il preprocessing del caso corrente.</div>
           </div>
           <div class="workspace-header-actions">
             <button id="workspace-refresh" class="btn" ${this.state.loading ? 'disabled' : ''}>Refresh</button>
-            <button id="workspace-dispatch" class="btn" ${this.state.loading ? 'disabled' : ''}>Start Next</button>
-            <button id="workspace-queue-unprocessed" class="btn">Queue All Unprocessed</button>
+            <button class="btn workspace-stop-all">Stop All</button>
             <button id="workspace-queue" class="btn btn-primary" ${selectedCount ? '' : 'disabled'}>Queue Selected</button>
           </div>
         </div>
@@ -507,24 +660,16 @@ const WorkspaceView = {
         <div class="import-summary-grid">
           <div class="import-summary-card"><div class="import-summary-label">Running</div><div class="import-summary-value">${overview.running_jobs.length}</div></div>
           <div class="import-summary-card"><div class="import-summary-label">Queued</div><div class="import-summary-value">${overview.queued_jobs.length}</div></div>
-          <div class="import-summary-card"><div class="import-summary-label">Candidates</div><div class="import-summary-value">${overview.sessions.length}</div></div>
+          <div class="import-summary-card"><div class="import-summary-label">Cases</div><div class="import-summary-value">${overview.sessions.length}</div></div>
           <div class="import-summary-card"><div class="import-summary-label">Selected</div><div class="import-summary-value">${selectedCount}</div></div>
         </div>
 
         <div class="workspace-grid">
           <section class="workspace-main">
-            <div class="card workspace-ops-card">
-              <div class="card-title">Run Flow</div>
-              <div class="workspace-ops-line"><strong>1.</strong><span>Seleziona uno o piu casi nella tabella.</span></div>
-              <div class="workspace-ops-line"><strong>2.</strong><span>Clicca <code>Queue Selected</code> per metterli in coda.</span></div>
-              <div class="workspace-ops-line"><strong>3.</strong><span>Clicca <code>Start Next</code> una volta per avviare il primo job disponibile.</span></div>
-              <div class="workspace-ops-line"><strong>4.</strong><span>Apri il caso con <code>Open</code> per seguire step, errori, output e log.</span></div>
-            </div>
-            ${this.renderCurrentJobCard()}
             ${this.renderSystemCard()}
             <div class="card">
               <div class="card-title">Cases</div>
-              <div class="workspace-table-hint">Uso consigliato: fai partire un solo caso alla volta, aprilo subito e controlla <code>Pipeline State</code> e <code>Log</code>.</div>
+              <div class="workspace-table-hint">Seleziona i casi da preprocessare. Il click sulla riga aggiorna il pannello destro con il caso corrente.</div>
               <div class="import-control-grid">
                 <label class="import-field import-field-small">
                   <span>Status</span>
@@ -564,21 +709,7 @@ const WorkspaceView = {
           </section>
 
           <aside class="workspace-side">
-            <div class="card">
-              <div class="card-title">Queue</div>
-              <div class="workspace-job-list">
-                ${[...overview.running_jobs, ...overview.queued_jobs].length
-                  ? [...overview.running_jobs, ...overview.queued_jobs].map(job => this.renderJob(job)).join('')
-                  : `<div class="workspace-empty-block">No active queue.</div>`}
-              </div>
-            </div>
-
-            <div class="card">
-              <div class="card-title">Recent Jobs</div>
-              <div class="workspace-job-list">
-                ${(overview.recent_jobs || []).slice(0, 10).map(job => this.renderJob(job)).join('') || `<div class="workspace-empty-block">No recent jobs.</div>`}
-              </div>
-            </div>
+            ${this.renderProcessingCaseCard()}
           </aside>
         </div>
       </div>
@@ -588,33 +719,21 @@ const WorkspaceView = {
       await this.refreshOverview();
       this.render(app);
     });
-    app.querySelector('#workspace-dispatch')?.addEventListener('click', async () => {
-      try {
-        await GlioTwin.post('/api/processing/dispatch', {});
-        await this.refreshOverview();
-        this.render(app);
-      } catch (error) {
-        GlioTwin.toast(error.message, 'error');
-      }
-    });
     app.querySelector('#workspace-queue')?.addEventListener('click', async () => {
       try {
         const ids = this.selectedSessionIds();
         if (!ids.length) return;
+        this.clearPreprocessingStateLocally(ids[0]);
+        this.state.selectedJobId = null;
+        this.state.logText = '';
+        this.render(app);
         await GlioTwin.post('/api/processing/jobs/queue', { session_ids: ids });
+        await GlioTwin.post('/api/processing/dispatch', {});
+        this.state.focusedSessionId = ids[0];
+        await this.refreshCase(ids[0]);
         await this.refreshOverview();
         this.render(app);
-        GlioTwin.toast(`Queued ${ids.length} session(s)`, 'info');
-      } catch (error) {
-        GlioTwin.toast(error.message, 'error');
-      }
-    });
-    app.querySelector('#workspace-queue-unprocessed')?.addEventListener('click', async () => {
-      try {
-        const result = await GlioTwin.post('/api/processing/jobs/queue-unprocessed', {});
-        await this.refreshOverview();
-        this.render(app);
-        GlioTwin.toast(`Queued ${result.queued_jobs?.length || 0} unprocessed session(s)`, 'info');
+        GlioTwin.toast(`Queued and started ${ids.length} session(s)`, 'info');
       } catch (error) {
         GlioTwin.toast(error.message, 'error');
       }
@@ -635,18 +754,43 @@ const WorkspaceView = {
     app.querySelectorAll('.workspace-session-cb').forEach(el => {
       el.addEventListener('change', (e) => {
         this.state.selectedSessions[parseInt(e.target.dataset.sessionId, 10)] = e.target.checked;
+        this.render(app);
+      });
+    });
+    app.querySelectorAll('.import-table tbody tr').forEach(row => {
+      row.addEventListener('click', async (event) => {
+        if (event.target.closest('input,button,a')) return;
+        const openBtn = row.querySelector('.workspace-open-case');
+        if (!openBtn) return;
+        const sessionId = parseInt(openBtn.dataset.sessionId, 10);
+        await this.loadCase(sessionId);
+        this.render(app);
       });
     });
     app.querySelectorAll('.workspace-open-case').forEach(el => {
-      el.addEventListener('click', () => {
-        location.hash = `#/workspace/${el.dataset.sessionId}`;
+      el.addEventListener('click', async () => {
+        await this.loadCase(el.dataset.sessionId);
+        this.render(app);
+      });
+    });
+    app.querySelectorAll('.workspace-job-row[data-job-id]').forEach(el => {
+      el.addEventListener('click', async () => {
+        this.state.selectedJobId = parseInt(el.dataset.jobId, 10);
+        const log = await GlioTwin.fetch(`/api/processing/jobs/${this.state.selectedJobId}/log?tail=16000`);
+        this.state.logText = log.text || '';
+        this.render(app);
       });
     });
     app.querySelectorAll('.workspace-stop-all').forEach(el => {
       el.addEventListener('click', async () => {
         try {
           await GlioTwin.post('/api/processing/stop-all', {});
+          this.state.selectedJobId = null;
+          this.state.logText = '';
           await this.refreshOverview();
+          if (this.state.focusedSessionId) {
+            await this.refreshCase(this.state.focusedSessionId);
+          }
           this.render(app);
           GlioTwin.toast('All running and queued jobs stopped', 'info');
         } catch (error) {

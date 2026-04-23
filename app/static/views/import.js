@@ -50,6 +50,18 @@ const IMPORT_DATASETS = [
   },
 ];
 
+const IMPORT_STRUCTURE_OPTIONS = [
+  { key: 't1n', label: 'T1 native' },
+  { key: 't1c', label: 'T1 contrast' },
+  { key: 't2w', label: 'T2' },
+  { key: 't2f', label: 'FLAIR' },
+  { key: 'apt', label: 'APT' },
+  { key: 'adc', label: 'ADC' },
+  { key: 'swi', label: 'SWI' },
+  { key: 'dwi', label: 'DWI' },
+  { key: 'other', label: 'Other' },
+];
+
 const ImportView = {
   state: {
     selectedDataset: 'irst_dicom_raw',
@@ -57,6 +69,7 @@ const ImportView = {
     scan: null,
     rtAnalysis: null,
     selectedExamKey: null,
+    selectedSubjectKey: null,
     selectedRoot: '',
     rtFilePath: '/mnt/dati/RT_GBM_MOSAIQ_IMORT.xlsx',
     rtDataset: 'irst_dicom_raw',
@@ -65,12 +78,161 @@ const ImportView = {
     includeExam: {},
     includeSeries: {},
     coreChoice: {},
+    selectedStructures: ['t1n', 't1c', 't2w', 't2f', 'apt'],
     lastCommit: null,
     lastRtCommit: null,
   },
 
   _currentDatasetInfo() {
     return IMPORT_DATASETS.find(d => d.key === this.state.selectedDataset) || IMPORT_DATASETS[0];
+  },
+
+  _normText(value) {
+    return String(value || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toUpperCase()
+      .replace(/[^A-Z0-9 ]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  },
+
+  _scanPatientGroups(scan) {
+    const groups = new Map();
+    for (const exam of scan?.exams || []) {
+      const family = this._normText(exam.patient_family_name);
+      const given = this._normText(exam.patient_given_name);
+      const name = this._normText(exam.patient_name);
+      const birth = this._normText(exam.patient_birth_date);
+      const personKey = (family || given)
+        ? `${family}|${given}|${birth}`
+        : `${name}|${birth}`;
+      const key = personKey || `PID|${this._normText(exam.patient_id)}`;
+      if (!groups.has(key)) {
+        groups.set(key, {
+          key,
+          patientIdAliases: new Set(),
+          patientName: exam.patient_name || [exam.patient_given_name, exam.patient_family_name].filter(Boolean).join(' ') || exam.patient_id,
+          patientBirthDate: exam.patient_birth_date || '',
+          exams: [],
+        });
+      }
+      const group = groups.get(key);
+      group.patientIdAliases.add(exam.patient_id);
+      group.exams.push(exam);
+    }
+    return [...groups.values()].sort((a, b) => String(a.patientName).localeCompare(String(b.patientName)));
+  },
+
+  _matchRtToScan(scan, rtAnalysis) {
+    const scanGroups = this._scanPatientGroups(scan);
+    const nameIndex = new Map();
+    for (const group of scanGroups) {
+      const exam = group.exams[0] || {};
+      const family = this._normText(exam.patient_family_name);
+      const given = this._normText(exam.patient_given_name);
+      const name = this._normText(group.patientName);
+      const keys = [
+        `${family} ${given}`.trim(),
+        `${given} ${family}`.trim(),
+        name,
+      ].filter(Boolean);
+      keys.forEach((key) => {
+        if (!nameIndex.has(key)) nameIndex.set(key, []);
+        nameIndex.get(key).push(group);
+      });
+    }
+
+    const rows = (rtAnalysis?.rows || []).map((row) => {
+      const family = this._normText(row.patient_family_name);
+      const given = this._normText(row.patient_given_name);
+      const raw = this._normText(row.patient_name_raw);
+      const keys = [`${family} ${given}`.trim(), `${given} ${family}`.trim(), raw].filter(Boolean);
+      const matches = [];
+      const seen = new Set();
+      keys.forEach((key) => {
+        (nameIndex.get(key) || []).forEach((group) => {
+          if (seen.has(group.key)) return;
+          seen.add(group.key);
+          matches.push(group);
+        });
+      });
+      return {
+        ...row,
+        scan_matches: matches,
+        scan_match_status: matches.length === 1 ? 'matched' : matches.length > 1 ? 'ambiguous' : 'unmatched',
+      };
+    });
+
+    return {
+      scanGroups,
+      rows,
+      summary: {
+        scan_patients: scanGroups.length,
+        matched_rows: rows.filter((row) => row.scan_match_status === 'matched').length,
+        ambiguous_rows: rows.filter((row) => row.scan_match_status === 'ambiguous').length,
+        unmatched_rows: rows.filter((row) => row.scan_match_status === 'unmatched').length,
+      },
+    };
+  },
+
+  _buildUnifiedMatchRows(scan, rtAnalysis) {
+    const data = this._matchRtToScan(scan, rtAnalysis);
+    const byGroup = new Map();
+
+    data.scanGroups.forEach((group) => {
+      byGroup.set(group.key, {
+        group,
+        rtRows: [],
+      });
+    });
+
+    data.rows.forEach((row) => {
+      if (row.scan_matches?.length) {
+        row.scan_matches.forEach((group) => {
+          if (!byGroup.has(group.key)) {
+            byGroup.set(group.key, { group, rtRows: [] });
+          }
+          byGroup.get(group.key).rtRows.push(row);
+        });
+      }
+    });
+
+    const rows = [...byGroup.values()].map(({ group, rtRows }) => {
+      const uniqueRtNames = [...new Set(rtRows.map((row) => row.patient_name_raw).filter(Boolean))];
+      let matchStatus = 'unmatched';
+      if (rtRows.some((row) => row.scan_match_status === 'ambiguous')) {
+        matchStatus = 'ambiguous';
+      } else if (rtRows.some((row) => row.scan_match_status === 'matched')) {
+        matchStatus = 'matched';
+      }
+      if (!rtRows.length) matchStatus = 'missing_rt';
+
+      return {
+        key: group.key,
+        group,
+        patientName: group.patientName,
+        patientBirthDate: group.patientBirthDate,
+        patientIdAliases: [...group.patientIdAliases],
+        examCount: group.exams.length,
+        readyCount: group.exams.filter((exam) => exam.status === 'ready').length,
+        reviewCount: group.exams.filter((exam) => exam.status === 'review').length,
+        incompleteCount: group.exams.filter((exam) => exam.status === 'incomplete').length,
+        rtCount: rtRows.length,
+        rtNames: uniqueRtNames,
+        matchStatus,
+      };
+    });
+
+    return {
+      rows: rows.sort((a, b) => String(a.patientName).localeCompare(String(b.patientName))),
+      summary: {
+        total: rows.length,
+        matched: rows.filter((row) => row.matchStatus === 'matched').length,
+        ambiguous: rows.filter((row) => row.matchStatus === 'ambiguous').length,
+        missing_rt: rows.filter((row) => row.matchStatus === 'missing_rt').length,
+      },
+    };
   },
 
   statusBadge(status) {
@@ -104,6 +266,77 @@ const ImportView = {
   selectedExam() {
     if (!this.state.selectedExamKey) return null;
     return this.examByKey().get(this.state.selectedExamKey) || null;
+  },
+
+  selectedSubject() {
+    if (!this.state.selectedSubjectKey) return null;
+    return this._scanPatientGroups(this.state.scan).find(group => group.key === this.state.selectedSubjectKey) || null;
+  },
+
+  _filteredExams(scan) {
+    if (!this.state.selectedSubjectKey) return scan?.exams || [];
+    const group = this._scanPatientGroups(scan).find(item => item.key === this.state.selectedSubjectKey);
+    return group?.exams || [];
+  },
+
+  _subjectSelectionState(group) {
+    const exams = group.exams || [];
+    const selected = exams.filter(exam => this.state.includeExam[exam.exam_key] !== false).length;
+    return {
+      total: exams.length,
+      selected,
+      all: !!exams.length && selected === exams.length,
+      some: selected > 0 && selected < exams.length,
+    };
+  },
+
+  selectExam(examKey, app) {
+    if (!examKey) return;
+    this.state.selectedExamKey = examKey;
+    this.render(app || document.getElementById('app'));
+  },
+
+  selectSubject(subjectKey, app) {
+    this.state.selectedSubjectKey = subjectKey || null;
+    const exams = this._filteredExams(this.state.scan);
+    if (!exams.some(exam => exam.exam_key === this.state.selectedExamKey)) {
+      this.state.selectedExamKey = exams[0]?.exam_key || null;
+    }
+    this.render(app || document.getElementById('app'));
+  },
+
+  toggleSubjectSelection(subjectKey, checked, app) {
+    const group = this._scanPatientGroups(this.state.scan).find(item => item.key === subjectKey);
+    if (!group) return;
+    for (const exam of group.exams) {
+      this.state.includeExam[exam.exam_key] = checked;
+    }
+    if (checked) {
+      this.state.selectedSubjectKey = subjectKey;
+      if (!group.exams.some(exam => exam.exam_key === this.state.selectedExamKey)) {
+        this.state.selectedExamKey = group.exams[0]?.exam_key || null;
+      }
+    } else if (this.state.selectedSubjectKey === subjectKey && !this._subjectSelectionState(group).selected) {
+      const fallback = this._scanPatientGroups(this.state.scan).find(item => this._subjectSelectionState(item).selected);
+      this.state.selectedSubjectKey = fallback?.key || subjectKey;
+      const exams = this._filteredExams(this.state.scan);
+      this.state.selectedExamKey = exams[0]?.exam_key || null;
+    }
+    this.render(app || document.getElementById('app'));
+  },
+
+  toggleAllSubjectsSelection(checked, app) {
+    for (const group of this._scanPatientGroups(this.state.scan)) {
+      for (const exam of group.exams) {
+        this.state.includeExam[exam.exam_key] = checked;
+      }
+    }
+    if (checked) {
+      const firstGroup = this._scanPatientGroups(this.state.scan)[0];
+      this.state.selectedSubjectKey = firstGroup?.key || null;
+      this.state.selectedExamKey = firstGroup?.exams?.[0]?.exam_key || null;
+    }
+    this.render(app || document.getElementById('app'));
   },
 
   selectionSummary() {
@@ -145,7 +378,9 @@ const ImportView = {
         this.state.includeSeries[key] = isCore || isPreferredExtra;
       }
     }
-    this.state.selectedExamKey = scan.exams?.[0]?.exam_key || null;
+    const groups = this._scanPatientGroups(scan);
+    this.state.selectedSubjectKey = groups[0]?.key || null;
+    this.state.selectedExamKey = (groups[0]?.exams || scan.exams || [])[0]?.exam_key || null;
   },
 
   async loadRoots() {
@@ -158,7 +393,6 @@ const ImportView = {
 
   async runScan() {
     const rootPath = document.getElementById('import-root')?.value?.trim();
-    const limitRaw = document.getElementById('import-limit')?.value?.trim();
     if (!rootPath) {
       GlioTwin.toast('Select a root path first', 'error');
       return;
@@ -166,10 +400,7 @@ const ImportView = {
     this.state.loading = true;
     this.render(document.getElementById('app'));
     try {
-      const payload = {
-        root_path: rootPath,
-        limit_studies: limitRaw ? parseInt(limitRaw, 10) : null,
-      };
+      const payload = { root_path: rootPath };
       const scan = await GlioTwin.post('/api/import/scan', payload);
       this.state.selectedRoot = rootPath;
       this.state.scan = scan;
@@ -181,6 +412,47 @@ const ImportView = {
       GlioTwin.toast(error.message, 'error');
     } finally {
       this.state.loading = false;
+      this.render(document.getElementById('app'));
+    }
+  },
+
+  async runDiscover() {
+    const rootPath = document.getElementById('import-root')?.value?.trim();
+    const filePath = document.getElementById('rt-import-path')?.value?.trim();
+    if (!rootPath && !filePath) {
+      GlioTwin.toast('Select at least one source path', 'error');
+      return;
+    }
+    this.state.loading = true;
+    this.state.rtLoading = true;
+    this.render(document.getElementById('app'));
+    try {
+      if (rootPath) {
+        const scan = await GlioTwin.post('/api/import/scan', {
+          root_path: rootPath,
+          requested_structures: this.state.selectedStructures,
+        });
+        this.state.selectedRoot = rootPath;
+        this.state.scan = scan;
+        this.state.lastCommit = null;
+        this.initSelection(scan);
+      }
+      if (filePath) {
+        const result = await GlioTwin.post('/api/import/rt/analyze', {
+          file_path: filePath,
+          dataset: this.state.rtDataset || 'irst_dicom_raw',
+        });
+        this.state.rtFilePath = filePath;
+        this.state.rtAnalysis = result;
+        this.state.lastRtCommit = null;
+      }
+      GlioTwin.toast('Sources loaded', 'info');
+    } catch (error) {
+      console.error('[import discover]', error);
+      GlioTwin.toast(error.message, 'error');
+    } finally {
+      this.state.loading = false;
+      this.state.rtLoading = false;
       this.render(document.getElementById('app'));
     }
   },
@@ -221,7 +493,7 @@ const ImportView = {
 
   async runRtAnalyze() {
     const filePath = document.getElementById('rt-import-path')?.value?.trim();
-    const dataset = document.getElementById('rt-import-dataset')?.value?.trim() || 'irst_dicom_raw';
+    const dataset = this.state.rtDataset || 'irst_dicom_raw';
     if (!filePath) {
       GlioTwin.toast('Select an RT Excel file first', 'error');
       return;
@@ -249,7 +521,7 @@ const ImportView = {
 
   async runRtCommit() {
     const filePath = document.getElementById('rt-import-path')?.value?.trim();
-    const dataset = document.getElementById('rt-import-dataset')?.value?.trim() || 'irst_dicom_raw';
+    const dataset = this.state.rtDataset || 'irst_dicom_raw';
     if (!filePath) {
       GlioTwin.toast('Select an RT Excel file first', 'error');
       return;
@@ -278,12 +550,10 @@ const ImportView = {
   renderSummary(scan) {
     const s = scan.summary;
     const cards = [
-      ['Exams', s.total_exams, 'All studies grouped by patient + study UID'],
-      ['Ready', s.ready_exams, '4 core sequences selected with no ambiguity'],
-      ['Review', s.review_exams, '4 core sequences found, but at least one class has multiple candidates'],
-      ['Incomplete', s.incomplete_exams, 'One or more core sequences are missing'],
-      ['Extras', s.extra_series, 'Recognized non-core MRI series'],
-      ['Other', s.other_series, 'Unclassified or non-useful series'],
+      ['Exams', s.total_exams, 'studi trovati'],
+      ['Ready', s.ready_exams, '4 core univoche'],
+      ['Review', s.review_exams, '4 core trovate ma con scelte multiple'],
+      ['Incomplete', s.incomplete_exams, 'manca almeno una core'],
     ];
     return `
       <div class="import-summary-grid">
@@ -299,15 +569,20 @@ const ImportView = {
   },
 
   renderExamTable(scan) {
-    const rows = scan.exams.map(exam => {
+    const exams = this._filteredExams(scan);
+    const rows = exams.map(exam => {
       const selected = this.state.selectedExamKey === exam.exam_key ? 'selected' : '';
       const enabled = this.state.includeExam[exam.exam_key] !== false;
+      const isReview = exam.status === 'review';
+      const ambiguousCount = ['t1n', 't1c', 't2w', 't2f']
+        .filter(label => (exam.core_candidates?.[label] || []).length > 1)
+        .length;
       const cores = ['t1n', 't1c', 't2w', 't2f'].map(label => {
         const item = exam.core_selection[label];
         return `<span class="import-core-pill ${item ? 'ok' : 'missing'}">${String(label || '').toUpperCase() || 'OTHER'}</span>`;
       }).join('');
       return `
-        <tr class="import-row ${selected}" data-exam-key="${exam.exam_key}">
+        <tr class="import-row ${selected}" data-exam-key="${exam.exam_key}" data-role="exam-row">
           <td><input type="checkbox" class="exam-include" data-exam-key="${exam.exam_key}" ${enabled ? 'checked' : ''}></td>
           <td>
             <div class="import-cell-title">${GlioTwin.patientPrimary(exam)}</div>
@@ -322,16 +597,33 @@ const ImportView = {
             <div class="import-cell-sub">${exam.series_count} series</div>
           </td>
           <td>${this.statusBadge(exam.status)}</td>
-          <td><div class="import-core-strip">${cores}</div></td>
+          <td>
+            <div class="import-core-strip">${cores}</div>
+            ${isReview ? `<div class="import-cell-sub">Ambiguous core classes: ${ambiguousCount}</div>` : ''}
+          </td>
           <td>${exam.extra_series_count}</td>
         </tr>
       `;
     }).join('');
 
-    const allChecked = scan.exams.every(e => this.state.includeExam[e.exam_key] !== false);
-    const someChecked = !allChecked && scan.exams.some(e => this.state.includeExam[e.exam_key] !== false);
+    const allChecked = exams.length ? exams.every(e => this.state.includeExam[e.exam_key] !== false) : false;
+    const someChecked = !allChecked && exams.some(e => this.state.includeExam[e.exam_key] !== false);
     return `
-      <div class="import-table-wrap">
+      <div class="import-table-section card">
+        <div class="import-table-head">
+          <div>
+            <div class="card-title">Exams</div>
+            <div class="import-table-note">
+              <strong>Review</strong> significa che l'esame e completo: le 4 sequenze core sono state trovate,
+              ma almeno una classe ha piu candidati. Non vengono fuse assieme: il sistema preseleziona il candidato
+              migliore e tu puoi cambiarlo nel pannello di destra.
+            </div>
+          </div>
+          <div class="import-table-meta">
+            <span>${exams.length} esami</span>
+            <span>${exams.filter(e => e.status === 'review').length} ambigui</span>
+          </div>
+        </div>
         <table class="import-table">
           <thead>
             <tr>
@@ -449,13 +741,13 @@ const ImportView = {
     `;
   },
 
-  renderRtSummary(analysis) {
-    const s = analysis.summary || {};
+  renderMatchSummary(scan, rtAnalysis) {
+    const unified = this._buildUnifiedMatchRows(scan, rtAnalysis);
     const cards = [
-      ['Rows', s.rows_total || 0, 'Rows parsed from the Excel file'],
-      ['Matched', s.matched_rows || 0, 'Single patient hit by normalized surname + name'],
-      ['Ambiguous', s.ambiguous_rows || 0, 'More than one DB patient matches the same RT name'],
-      ['Unmatched', s.unmatched_rows || 0, 'No patient in the selected dataset matches the RT name'],
+      ['Found', unified.summary.total || 0, 'soggetti'],
+      ['Matched', unified.summary.matched || 0, 'RT univoco'],
+      ['Ambiguous', unified.summary.ambiguous || 0, 'da verificare'],
+      ['No RT', unified.summary.missing_rt || 0, 'senza match'],
     ];
     return `
       <div class="import-summary-grid">
@@ -470,51 +762,90 @@ const ImportView = {
     `;
   },
 
-  renderRtRows(analysis) {
-    const rows = (analysis.rows || []).slice(0, 40).map(row => `
-      <tr>
-        <td><span class="badge badge-import-${row.status}">${row.status}</span></td>
-        <td>
-          <div class="import-cell-title">${GlioTwin.fmt(row.patient_name_raw)}</div>
-          <div class="import-cell-sub">row ${row.row_index}${row.ida ? ` · IDA ${row.ida}` : ''}</div>
-        </td>
-        <td>${GlioTwin.fmt(row.tax_code)}</td>
-        <td>${GlioTwin.fmt(row.fractions_count)}</td>
-        <td>${GlioTwin.fmt(row.diagnosis_date)}</td>
-        <td>${GlioTwin.fmt(row.start_date)}</td>
-        <td>
-          ${(row.candidates || []).map(candidate => `
-            <div class="import-cell-sub">
-              ${GlioTwin.fmt(candidate.patient_name)} · ${GlioTwin.fmt(candidate.subject_id)}
-              ${GlioTwin.state.showSensitive && candidate.patient_birth_date ? ` · DOB ${GlioTwin.dicomDate(candidate.patient_birth_date)}` : ''}
-            </div>
-          `).join('') || '<span class="text-muted">—</span>'}
-        </td>
-      </tr>
-    `).join('');
-
+  renderUnifiedMatchTable(scan, rtAnalysis) {
+    const data = this._buildUnifiedMatchRows(scan, rtAnalysis);
+    const allSelected = data.rows.length ? data.rows.every(row => this._subjectSelectionState(row.group || { exams: [] }).all) : false;
+    const someSelected = !allSelected && data.rows.some(row => this._subjectSelectionState(row.group || { exams: [] }).selected);
     return `
-      <div class="import-detail-block">
-        <div class="import-detail-block-title">RT preview</div>
+      <div class="import-cross-card">
+        <div class="import-table-head">
+          <div>
+            <div class="card-title">Subjects</div>
+            <div class="import-table-note">
+              Una riga per soggetto DICOM accorpato. Qui vedi il match RT senza lasciare la schermata esami.
+            </div>
+          </div>
+        </div>
         <div class="import-series-wrap">
           <table class="import-table import-series-table">
             <thead>
               <tr>
-                <th>Status</th>
-                <th>RT row</th>
-                <th>Tax code</th>
-                <th>Fractions</th>
-                <th>Diagnosis</th>
-                <th>RT start</th>
-                <th>DB candidates</th>
+                <th><input type="checkbox" id="subject-select-all" ${allSelected ? 'checked' : ''} ${someSelected ? 'data-indeterminate="true"' : ''}> All</th>
+                <th>Soggetto</th>
+                <th>ID DICOM</th>
+                <th>Studi</th>
+                <th>Core status</th>
+                <th>RT match</th>
+                <th>Nome RT</th>
               </tr>
             </thead>
-            <tbody>${rows || `<tr><td colspan="7" class="import-empty-cell">No RT rows found.</td></tr>`}</tbody>
+            <tbody>
+              ${data.rows.length ? data.rows.map((row) => {
+                const group = this._scanPatientGroups(scan).find(item => item.key === row.key);
+                const state = this._subjectSelectionState(group || { exams: [] });
+                const selectedRow = this.state.selectedSubjectKey === row.key ? 'selected' : '';
+                return `
+                <tr class="import-row ${selectedRow}" data-role="subject-row" data-subject-key="${row.key}">
+                  <td><input type="checkbox" class="subject-include" data-subject-key="${row.key}" ${state.all ? 'checked' : ''} ${state.some ? 'data-indeterminate="true"' : ''}></td>
+                  <td>
+                    <div class="import-cell-title">${GlioTwin.fmt(row.patientName)}</div>
+                    ${row.patientBirthDate ? `<div class="import-cell-sub">DOB ${GlioTwin.dicomDate(row.patientBirthDate)}</div>` : ''}
+                  </td>
+                  <td>
+                    <div class="import-cell-sub">${row.patientIdAliases.join(', ')}</div>
+                  </td>
+                  <td>
+                    <div class="import-cell-title">${row.examCount}</div>
+                    <div class="import-cell-sub">timepoint/studi letti</div>
+                  </td>
+                  <td>
+                    <div class="import-cell-sub">${row.readyCount} ready · ${row.reviewCount} review · ${row.incompleteCount} incomplete</div>
+                  </td>
+                  <td>
+                    <span class="badge badge-import-${row.matchStatus}">${row.matchStatus}</span>
+                  </td>
+                  <td>
+                    ${row.rtNames.length ? row.rtNames.map((name) => `
+                      <div class="import-cell-sub">${GlioTwin.fmt(name)}</div>
+                    `).join('') : '<span class="text-muted">—</span>'}
+                  </td>
+                </tr>
+              `;
+              }).join('') : `<tr><td colspan="7" class="import-empty-cell">Nessun dato disponibile.</td></tr>`}
+            </tbody>
           </table>
         </div>
-        ${(analysis.rows || []).length > 40 ? `
-          <div class="import-helper-text">Showing first 40 rows only. The import still considers the full file.</div>
-        ` : ''}
+      </div>
+    `;
+  },
+
+  renderStructureSelector() {
+    return `
+      <div class="import-structure-box">
+        <div class="import-inline-title">Structures to search</div>
+        <div class="import-structure-list">
+          ${IMPORT_STRUCTURE_OPTIONS.map((option) => `
+            <label class="import-structure-chip">
+              <input
+                type="checkbox"
+                class="structure-include"
+                data-structure-key="${option.key}"
+                ${this.state.selectedStructures.includes(option.key) ? 'checked' : ''}
+              >
+              <span>${option.label}</span>
+            </label>
+          `).join('')}
+        </div>
       </div>
     `;
   },
@@ -528,29 +859,59 @@ const ImportView = {
       });
     });
 
-    app.querySelector('#import-run-scan')?.addEventListener('click', () => this.runScan());
+    app.querySelector('#import-run-discover')?.addEventListener('click', () => this.runDiscover());
     app.querySelector('#import-run-commit')?.addEventListener('click', () => this.runCommit());
-    app.querySelector('#rt-import-analyze')?.addEventListener('click', () => this.runRtAnalyze());
-    app.querySelector('#rt-import-commit')?.addEventListener('click', () => this.runRtCommit());
-    app.querySelectorAll('.import-row').forEach(row => {
-      row.addEventListener('click', (event) => {
-        if (event.target.closest('input')) return;
-        this.state.selectedExamKey = row.dataset.examKey;
-        this.render(app);
+    app.querySelectorAll('.structure-include').forEach(input => {
+      input.addEventListener('change', (event) => {
+        const key = event.target.dataset.structureKey;
+        if (event.target.checked) {
+          if (!this.state.selectedStructures.includes(key)) this.state.selectedStructures.push(key);
+        } else {
+          this.state.selectedStructures = this.state.selectedStructures.filter(item => item !== key);
+        }
       });
+    });
+    app.querySelector('.import-cross-card tbody')?.addEventListener('click', (event) => {
+      if (event.target.closest('input')) return;
+      const row = event.target.closest('[data-role="subject-row"]');
+      if (!row) return;
+      this.selectSubject(row.dataset.subjectKey, app);
+    });
+    const subjectSelectAll = app.querySelector('#subject-select-all');
+    if (subjectSelectAll?.dataset.indeterminate === 'true') subjectSelectAll.indeterminate = true;
+    subjectSelectAll?.addEventListener('change', (event) => {
+      this.toggleAllSubjectsSelection(event.target.checked, app);
+    });
+    app.querySelectorAll('.subject-include').forEach(input => {
+      if (input.dataset.indeterminate === 'true') input.indeterminate = true;
+      input.addEventListener('change', (event) => {
+        this.toggleSubjectSelection(event.target.dataset.subjectKey, event.target.checked, app);
+      });
+    });
+    app.querySelector('.import-table-section tbody')?.addEventListener('click', (event) => {
+      if (event.target.closest('input')) return;
+      const row = event.target.closest('[data-role="exam-row"]');
+      if (!row) return;
+      this.selectExam(row.dataset.examKey, app);
     });
     const selectAll = app.querySelector('#exam-select-all');
     if (selectAll?.dataset.indeterminate === 'true') selectAll.indeterminate = true;
     selectAll?.addEventListener('change', (event) => {
       const checked = event.target.checked;
-      for (const exam of this.state.scan?.exams || []) {
+      for (const exam of this._filteredExams(this.state.scan)) {
         this.state.includeExam[exam.exam_key] = checked;
       }
+      const exams = this._filteredExams(this.state.scan);
+      if (checked && exams.length) this.state.selectedExamKey = exams[0].exam_key;
       this.render(app);
     });
     app.querySelectorAll('.exam-include').forEach(input => {
       input.addEventListener('change', (event) => {
         this.state.includeExam[event.target.dataset.examKey] = event.target.checked;
+        const exams = this._filteredExams(this.state.scan).filter(exam => this.state.includeExam[exam.exam_key] !== false);
+        if (!exams.some(exam => exam.exam_key === this.state.selectedExamKey)) {
+          this.state.selectedExamKey = exams[0]?.exam_key || null;
+        }
         this.render(app);
       });
     });
@@ -594,59 +955,58 @@ const ImportView = {
   },
 
   renderIrstSection(scan, rtAnalysis, selection) {
+    const hasSelectedExams = selection.examsIncluded > 0;
     return `
-      <div class="import-controls card">
-        <div class="card-title">Scan Root</div>
-        <div class="import-control-grid">
-          <label class="import-field">
-            <span>Server path</span>
-            <input id="import-root" class="import-input" list="import-roots" value="${this.state.selectedRoot || ''}" placeholder="/mnt/dati/irst_data/irst_dicom_raw/DICOM GBM">
-            <datalist id="import-roots">
-              ${(this.state.roots || []).map(root => `<option value="${root}"></option>`).join('')}
-            </datalist>
-          </label>
-          <label class="import-field import-field-small">
-            <span>Study limit</span>
-            <input id="import-limit" class="import-input" type="number" min="1" max="2000" placeholder="all">
-          </label>
-          <button id="import-run-scan" class="btn btn-primary" ${this.state.loading ? 'disabled' : ''}>
-            ${this.state.loading ? 'Scanning…' : 'Scan'}
-          </button>
+      <div class="import-controls import-ops-card card">
+        <div class="import-ops-head">
+          <div>
+            <div class="card-title">Read Sources And Import</div>
+            <div class="import-ops-subtitle">Scegli sorgente DICOM e file RT, leggi entrambe le fonti, controlla il match e poi importa i selezionati.</div>
+          </div>
+          ${(scan || rtAnalysis) ? `<div class="import-preview-chip">${selection.examsIncluded} esami selezionati · ${selection.seriesIncluded} serie</div>` : ''}
         </div>
-        <div class="import-action-row">
-          <button id="import-run-commit" class="btn" ${(!scan || this.state.loading) ? 'disabled' : ''}>
-            ${this.state.loading ? 'Working…' : 'Import Selected'}
-          </button>
-          <div class="import-action-hint">Importa le serie DICOM selezionate nel catalogo SQLite come dataset <code>irst_dicom_raw</code>. Nessun preprocessing ancora.</div>
-        </div>
-        <div class="import-helper-text">
-          Prima fase: costruisce un manifest ispezionabile dal DICOM grezzo senza toccare il DB clinico. Il processo è auditabile e rieseguibile.
-        </div>
-      </div>
 
-      <div class="import-controls card">
-        <div class="card-title">Import RT</div>
-        <div class="import-control-grid">
-          <label class="import-field">
-            <span>Excel path</span>
-            <input id="rt-import-path" class="import-input" value="${this.state.rtFilePath || ''}" placeholder="/mnt/dati/RT_GBM_MOSAIQ_IMORT.xlsx">
-          </label>
-          <label class="import-field import-field-small">
-            <span>Dataset</span>
-            <input id="rt-import-dataset" class="import-input" value="${this.state.rtDataset || 'irst_dicom_raw'}" placeholder="irst_dicom_raw" readonly>
-          </label>
-          <button id="rt-import-analyze" class="btn btn-primary" ${this.state.rtLoading ? 'disabled' : ''}>
-            ${this.state.rtLoading ? 'Working…' : 'Analyze RT'}
-          </button>
+        <div class="import-dual-grid">
+          <div class="import-inline-group">
+            <div class="import-inline-title">DICOM source</div>
+            <div class="import-control-grid import-control-grid-compact">
+              <label class="import-field">
+                <span>Server path</span>
+                <input id="import-root" class="import-input" list="import-roots" value="${this.state.selectedRoot || ''}" placeholder="/mnt/dati/irst_data/irst_dicom_raw/DICOM GBM">
+                <datalist id="import-roots">
+                  ${(this.state.roots || []).map(root => `<option value="${root}"></option>`).join('')}
+                </datalist>
+              </label>
+            </div>
+          </div>
+
+          <div class="import-inline-group">
+            <div class="import-inline-title">RT source</div>
+            <div class="import-control-grid import-control-grid-compact">
+              <label class="import-field">
+                <span>Excel path</span>
+                <input id="rt-import-path" class="import-input" value="${this.state.rtFilePath || ''}" placeholder="/mnt/dati/RT_GBM_MOSAIQ_IMORT.xlsx">
+              </label>
+            </div>
+          </div>
         </div>
-        <div class="import-action-row">
-          <button id="rt-import-commit" class="btn" ${this.state.rtLoading ? 'disabled' : ''}>
-            ${this.state.rtLoading ? 'Working…' : 'Import RT'}
+
+        ${this.renderStructureSelector()}
+
+        <div class="import-primary-row">
+          <button id="import-run-discover" class="btn" ${(this.state.loading || this.state.rtLoading) ? 'disabled' : ''}>
+            ${(this.state.loading || this.state.rtLoading) ? 'Reading…' : 'Scan Sources'}
           </button>
-          <div class="import-action-hint">Importa solo i match non ambigui nel DB clinico. Righe ambigue e non trovate restano in attesa di revisione manuale.</div>
+          ${hasSelectedExams ? `
+            <button id="import-run-commit" class="btn btn-primary import-primary-btn" ${(!scan || this.state.loading || this.state.rtLoading) ? 'disabled' : ''}>
+              ${(this.state.loading || this.state.rtLoading) ? 'Working…' : 'Import Selected'}
+            </button>
+          ` : ''}
+          <div class="import-action-hint">Legge le due sorgenti, cerca corrispondenze paziente e poi importa solo gli studi DICOM selezionati.</div>
         </div>
+
         <div class="import-helper-text">
-          Il matching usa <code>COGNOME, NOME</code> normalizzato. I campi importati sono: external refs RT, metadati corso RT, evento diagnosi, evento inizio radioterapia.
+          Gli esami in <code>review</code> sono completi: le 4 core sono state trovate, ma almeno una classe ha piu candidati. Il sistema non li accorpa: sceglie il migliore per default e tu puoi cambiarlo nel pannello di destra.
         </div>
       </div>
 
@@ -693,9 +1053,13 @@ const ImportView = {
         </div>
       `}
 
+      ${scan && rtAnalysis ? `
+        <div class="card import-match-strip">
+          ${this.renderMatchSummary(scan, rtAnalysis)}
+          ${this.renderUnifiedMatchTable(scan, rtAnalysis)}
+        </div>
+      ` : scan ? this.renderSummary(scan) : ''}
       ${scan ? this.renderExamTable(scan) : ''}
-      ${rtAnalysis ? this.renderRtSummary(rtAnalysis) : ''}
-      ${rtAnalysis ? this.renderRtRows(rtAnalysis) : ''}
     `;
   },
 

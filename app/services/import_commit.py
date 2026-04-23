@@ -10,6 +10,13 @@ from fastapi import HTTPException
 from app.db import db
 from app.services.import_scan import REQUIRED_CLASSES, _image_type_values, _read_anchor, scan_dicom_root
 from app.services.pipeline_state import ensure_state, reset_downstream_steps, update_step
+from app.services.subject_identity import (
+    add_subject_alias,
+    create_subject,
+    find_subject_by_alias,
+    normalize_person_key,
+    update_subject_demographics,
+)
 
 DATASET_NAME = "irst_dicom_raw"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -48,55 +55,78 @@ def _selected_core(exam: dict[str, Any], core_choice: dict[str, str]) -> dict[st
     return selected
 
 
-def _upsert_subject(conn, exam: dict[str, Any]) -> int:
+def _upsert_subject(conn, exam: dict[str, Any]) -> dict[str, Any]:
     notes = f"Imported from DICOM root · patient_folder={exam['patient_folder']}"
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO subjects (
-            subject_id, dataset, notes, sex,
-            patient_name, patient_given_name, patient_family_name, patient_birth_date
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            exam["patient_id"],
-            DATASET_NAME,
-            notes,
-            exam.get("patient_sex") or None,
-            exam.get("patient_name") or None,
-            exam.get("patient_given_name") or None,
-            exam.get("patient_family_name") or None,
-            exam.get("patient_birth_date") or None,
-        ),
+    person_key = normalize_person_key(
+        exam.get("patient_family_name"),
+        exam.get("patient_given_name"),
+        exam.get("patient_birth_date"),
     )
-    row = conn.execute(
-        "SELECT id, notes FROM subjects WHERE subject_id = ? AND dataset = ?",
-        (exam["patient_id"], DATASET_NAME),
-    ).fetchone()
-    if row:
-        conn.execute(
-            """
-            UPDATE subjects
-            SET notes = ?,
-                sex = COALESCE(NULLIF(?, ''), sex),
-                patient_name = COALESCE(NULLIF(?, ''), patient_name),
-                patient_given_name = COALESCE(NULLIF(?, ''), patient_given_name),
-                patient_family_name = COALESCE(NULLIF(?, ''), patient_family_name),
-                patient_birth_date = COALESCE(NULLIF(?, ''), patient_birth_date),
-                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-            WHERE id = ?
-            """,
-            (
-                notes if not row["notes"] else row["notes"],
-                exam.get("patient_sex") or "",
-                exam.get("patient_name") or "",
-                exam.get("patient_given_name") or "",
-                exam.get("patient_family_name") or "",
-                exam.get("patient_birth_date") or "",
-                row["id"],
-            ),
+    row = find_subject_by_alias(
+        conn,
+        source_system="dicom",
+        alias_type="patient_id",
+        alias_value=exam["patient_id"],
+        dataset=DATASET_NAME,
+    )
+    if row is None and person_key:
+        row = find_subject_by_alias(
+            conn,
+            source_system="identity",
+            alias_type="person_key",
+            alias_norm=person_key,
+            dataset=DATASET_NAME,
         )
-    return int(row["id"])
+    if row is None:
+        subject_pk = create_subject(
+            conn,
+            DATASET_NAME,
+            patient_name=exam.get("patient_name") or None,
+            patient_given_name=exam.get("patient_given_name") or None,
+            patient_family_name=exam.get("patient_family_name") or None,
+            patient_birth_date=exam.get("patient_birth_date") or None,
+            sex=exam.get("patient_sex") or None,
+            notes=notes,
+        )
+        row = conn.execute("SELECT * FROM subjects WHERE id = ?", (subject_pk,)).fetchone()
+    update_subject_demographics(
+        conn,
+        int(row["id"]),
+        patient_name=exam.get("patient_name") or None,
+        patient_given_name=exam.get("patient_given_name") or None,
+        patient_family_name=exam.get("patient_family_name") or None,
+        patient_birth_date=exam.get("patient_birth_date") or None,
+        sex=exam.get("patient_sex") or None,
+        notes=notes,
+    )
+    add_subject_alias(
+        conn,
+        int(row["id"]),
+        source_system="dicom",
+        alias_type="patient_id",
+        alias_value=exam["patient_id"],
+        raw_value=exam["patient_id"],
+    )
+    add_subject_alias(
+        conn,
+        int(row["id"]),
+        source_system="dicom",
+        alias_type="patient_folder",
+        alias_value=exam["patient_folder"],
+        raw_value=exam["patient_folder"],
+    )
+    if person_key:
+        add_subject_alias(
+            conn,
+            int(row["id"]),
+            source_system="identity",
+            alias_type="person_key",
+            alias_value=person_key,
+            alias_norm=person_key,
+            raw_value=exam.get("patient_name") or person_key,
+        )
+    refreshed = conn.execute("SELECT * FROM subjects WHERE id = ?", (int(row["id"]),)).fetchone()
+    return dict(refreshed)
 
 
 def _upsert_session(conn, subject_pk: int, exam: dict[str, Any]) -> int:
@@ -328,16 +358,14 @@ def _upsert_sequence(conn, session_pk: int, subject_id: str, timepoint_label: st
     sequence_type, contrast_agent, metadata_json = _sequence_payload(series, label)
     processed_path = None
     if label == "apt":
-        native_path, apt_error = _convert_apt_series(subject_id, timepoint_label, series)
-        # Registration into FeTS space happens at FeTS finalize time when T1ce
-        # processed_path (FeTS NIfTI) is available.  Store native for now.
-        processed_path = native_path
         metadata = json.loads(metadata_json)
-        metadata["apt_native_path"] = native_path
+        metadata["apt_native_path"] = None
         metadata["apt_registered_path"] = None
-        metadata["apt_resample_strategy"] = "pending_fets_transfer"
-        metadata["apt_conversion_error"] = apt_error
+        metadata["apt_transform_path"] = None
+        metadata["apt_resample_strategy"] = "deferred_until_preprocessing"
+        metadata["apt_conversion_error"] = None
         metadata["apt_registration_error"] = None
+        metadata["apt_conversion_deferred"] = True
         metadata_json = json.dumps(metadata, ensure_ascii=True)
     existing = conn.execute(
         "SELECT id, processed_path FROM sequences WHERE session_id = ? AND sequence_type = ?",
@@ -411,7 +439,9 @@ def commit_import_selection(
 
     with db() as conn:
         for exam in selected_exams:
-            subject_pk = _upsert_subject(conn, exam)
+            subject = _upsert_subject(conn, exam)
+            subject_pk = int(subject["id"])
+            internal_subject_id = str(subject["subject_id"])
             session_pk = _upsert_session(conn, subject_pk, exam)
             seen_subjects.add(subject_pk)
             seen_sessions.add(session_pk)
@@ -429,7 +459,7 @@ def commit_import_selection(
                     result["sequences_skipped"] += 1
                     result["skipped"].append({"exam_key": exam["exam_key"], "class_label": label, "reason": "deselected"})
                     continue
-                action = _upsert_sequence(conn, session_pk, exam["patient_id"], exam["timepoint_label"], series, label, exam)
+                action = _upsert_sequence(conn, session_pk, internal_subject_id, exam["timepoint_label"], series, label, exam)
                 result[f"sequences_{action}"] += 1
                 imported_any = True
                 imported_core = True
@@ -453,7 +483,7 @@ def commit_import_selection(
                         "reason": f"duplicate_extra_sequence_type:{sequence_type}",
                     })
                     continue
-                action = _upsert_sequence(conn, session_pk, exam["patient_id"], exam["timepoint_label"], series, series["class_label"], exam)
+                action = _upsert_sequence(conn, session_pk, internal_subject_id, exam["timepoint_label"], series, series["class_label"], exam)
                 result[f"sequences_{action}"] += 1
                 imported_extra_sequence_types.add(sequence_type)
                 imported_any = True
@@ -461,13 +491,13 @@ def commit_import_selection(
             if imported_any:
                 raw_dir = "/".join([exam["patient_folder"], exam["study_folder"]])
                 ensure_state(
-                    exam["patient_id"],
+                    internal_subject_id,
                     exam["timepoint_label"],
                     session_id=session_pk,
                     dataset=DATASET_NAME,
                 )
                 update_step(
-                    exam["patient_id"],
+                    internal_subject_id,
                     exam["timepoint_label"],
                     "import_dicom",
                     status="done",
@@ -481,7 +511,7 @@ def commit_import_selection(
                 missing_core = [label for label, series in _selected_core(exam, core_choice).items() if not series]
                 if missing_core:
                     update_step(
-                        exam["patient_id"],
+                        internal_subject_id,
                         exam["timepoint_label"],
                         "select_core_sequences",
                         status="failed",
@@ -494,7 +524,7 @@ def commit_import_selection(
                     )
                 else:
                     update_step(
-                        exam["patient_id"],
+                        internal_subject_id,
                         exam["timepoint_label"],
                         "select_core_sequences",
                         status="done",
@@ -507,7 +537,7 @@ def commit_import_selection(
                     )
                 if imported_core:
                     reset_downstream_steps(
-                        exam["patient_id"],
+                        internal_subject_id,
                         exam["timepoint_label"],
                         [
                             "initial_validation",
@@ -519,7 +549,8 @@ def commit_import_selection(
                 result["imported_exam_keys"].append(exam["exam_key"])
                 result["imported_sessions"].append({
                     "exam_key": exam["exam_key"],
-                    "patient_id": exam["patient_id"],
+                    "patient_id": internal_subject_id,
+                    "source_patient_id": exam["patient_id"],
                     "timepoint_label": exam["timepoint_label"],
                     "session_id": session_pk,
                     "subject_pk": subject_pk,

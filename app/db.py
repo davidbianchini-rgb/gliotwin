@@ -230,6 +230,23 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS subject_aliases (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject_id          INTEGER NOT NULL REFERENCES subjects(id) ON DELETE CASCADE,
+            source_system       TEXT    NOT NULL,
+            alias_type          TEXT    NOT NULL,
+            alias_value         TEXT    NOT NULL,
+            alias_norm          TEXT,
+            raw_value           TEXT,
+            created_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            updated_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            UNIQUE(source_system, alias_type, alias_value),
+            UNIQUE(source_system, alias_type, alias_norm)
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS radiotherapy_courses (
             id                  INTEGER PRIMARY KEY AUTOINCREMENT,
             subject_id          INTEGER NOT NULL REFERENCES subjects(id) ON DELETE CASCADE,
@@ -258,6 +275,7 @@ def init_db(db_path: Path = DB_PATH) -> None:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.executescript(sql)
         _run_migrations(conn)
+        conn.commit()
 
 
 @contextmanager

@@ -713,7 +713,7 @@ input, select { font-family: inherit; font-size: inherit; }
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1.5fr) minmax(360px, .9fr);
+  grid-template-columns: minmax(0, 1.8fr) minmax(360px, .82fr);
   gap: 14px;
   padding: 14px;
 }
@@ -739,11 +739,54 @@ input, select { font-family: inherit; font-size: inherit; }
   padding: 16px;
 }
 
+.import-ops-card {
+  padding: 14px 16px 16px;
+}
+
+.import-ops-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.import-ops-subtitle {
+  margin-top: 6px;
+  color: var(--text-dim);
+  line-height: 1.45;
+}
+
 .import-control-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 120px auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 12px;
   align-items: end;
+}
+
+.import-control-grid-compact {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.import-dual-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.import-inline-group {
+  padding: 12px;
+  border-radius: 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+
+.import-inline-title {
+  margin-bottom: 10px;
+  color: var(--text-dim);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .8px;
 }
 
 .import-field {
@@ -785,6 +828,17 @@ input, select { font-family: inherit; font-size: inherit; }
   display: flex;
   align-items: center;
   gap: 12px;
+}
+
+.import-primary-row {
+  margin-top: 14px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.import-primary-btn {
+  min-width: 180px;
 }
 
 .import-action-hint {
@@ -976,12 +1030,16 @@ input, select { font-family: inherit; font-size: inherit; }
 
 .import-summary-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.import-match-strip {
+  padding: 12px 14px 14px;
 }
 
 .import-summary-card {
-  padding: 14px;
+  padding: 12px 14px;
   border: 1px solid var(--border);
   border-radius: 12px;
   background: linear-gradient(180deg, rgba(23,32,51,.9), rgba(15,22,35,.94));
@@ -995,15 +1053,63 @@ input, select { font-family: inherit; font-size: inherit; }
 }
 
 .import-summary-value {
-  margin-top: 8px;
-  font-size: 24px;
+  margin-top: 6px;
+  font-size: 20px;
   font-weight: 700;
 }
 
 .import-summary-hint {
-  margin-top: 6px;
+  margin-top: 4px;
   color: var(--text-muted);
+  line-height: 1.35;
+  font-size: 11px;
+}
+
+.import-table-section {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
+}
+
+.import-cross-card {
+  margin-top: 10px;
+  padding: 0;
+  overflow: hidden;
+  border-top: 1px solid var(--border);
+}
+
+.import-table-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+  padding: 14px 16px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.import-table-note {
+  max-width: 900px;
+  color: var(--text-dim);
   line-height: 1.45;
+}
+
+.import-table-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.import-table-meta span {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  white-space: nowrap;
 }
 
 .import-table-wrap,
@@ -1014,6 +1120,21 @@ input, select { font-family: inherit; font-size: inherit; }
   border: 1px solid var(--border);
   border-radius: 12px;
   background: var(--surface);
+}
+
+.import-table-section .import-table {
+  display: block;
+  overflow: auto;
+  min-height: 0;
+  max-height: 62vh;
+}
+
+.import-table-section .import-table thead,
+.import-table-section .import-table tbody,
+.import-table-section .import-table tr {
+  display: table;
+  width: 100%;
+  table-layout: fixed;
 }
 
 .import-table {
@@ -1313,13 +1434,18 @@ input, select { font-family: inherit; font-size: inherit; }
   }
 
   .import-control-grid,
+  .import-control-grid-compact,
+  .import-dual-grid,
   .import-summary-grid,
   .import-core-grid,
   .import-result-grid {
     grid-template-columns: 1fr;
   }
 
-  .import-action-row {
+  .import-action-row,
+  .import-primary-row,
+  .import-ops-head,
+  .import-table-head {
     flex-direction: column;
     align-items: stretch;
   }
@@ -2593,17 +2719,6 @@ table.data-table {
   align-items: start;
 }
 .workspace-main, .workspace-side { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
-.workspace-ops-card { background: linear-gradient(180deg, rgba(59,126,248,.08), rgba(59,126,248,0)); }
-.workspace-ops-line {
-  display: grid;
-  grid-template-columns: 18px 1fr;
-  gap: 8px;
-  align-items: start;
-  font-size: 12px;
-  color: var(--text-dim);
-  margin-top: 6px;
-}
-.workspace-ops-line strong { color: var(--accent); }
 .workspace-table-hint {
   font-size: 11px;
   color: var(--text-dim);
@@ -2648,13 +2763,78 @@ table.data-table {
 }
 .workspace-current-main { font-size: 13px; font-weight: 700; color: var(--text); }
 .workspace-current-sub { font-size: 11px; color: var(--text-dim); }
+.workspace-phase-strip {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface-2);
+}
+.workspace-phase-dot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--text);
+}
+.workspace-phase-bullet {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: var(--text-dim);
+  flex: 0 0 auto;
+}
+.workspace-phase-dot.phase-ok .workspace-phase-bullet { background: var(--green); }
+.workspace-phase-dot.phase-running .workspace-phase-bullet,
+.workspace-phase-dot.phase-partial .workspace-phase-bullet,
+.workspace-phase-dot.phase-pending .workspace-phase-bullet { background: #facc15; }
+.workspace-phase-dot.phase-blocked .workspace-phase-bullet,
+.workspace-phase-dot.phase-waiting .workspace-phase-bullet { background: var(--red); }
+.workspace-phase-text { line-height: 1.35; }
+.workspace-phase-text strong { display: block; font-size: 12px; color: var(--text); }
+.workspace-phase-text small { display: block; font-size: 10px; color: var(--text-dim); line-height: 1.45; }
+.workspace-processing-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface-2);
+}
+.workspace-processing-row {
+  display: grid;
+  grid-template-columns: 130px 1fr;
+  gap: 10px;
+  align-items: start;
+}
+.workspace-processing-label {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.workspace-processing-value {
+  font-size: 12px;
+  color: var(--text);
+  line-height: 1.45;
+}
+.workspace-side-stack { display: flex; flex-direction: column; gap: 12px; margin-top: 14px; }
+.workspace-log-wrap { display: flex; flex-direction: column; min-width: 0; }
 .workspace-metrics {
   display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px;
 }
+.workspace-system-card .workspace-metrics { grid-template-columns: repeat(auto-fit, minmax(92px, 1fr)); }
 .workspace-metric {
   border: 1px solid var(--border); background: var(--surface-2);
   border-radius: var(--radius); padding: 10px 12px; display: flex; flex-direction: column; gap: 5px;
 }
+.workspace-system-card .workspace-metric { padding: 8px 10px; }
 .workspace-metric span { font-size: 10px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .04em; }
 .workspace-metric strong { font-size: 13px; color: var(--text); }
 .workspace-job-row {
@@ -2670,6 +2850,8 @@ table.data-table {
   padding: 12px; min-height: 280px; max-height: 560px; overflow: auto;
   font-size: 11px; line-height: 1.45; white-space: pre-wrap; word-break: break-word;
 }
+.workspace-main .import-table tbody tr { cursor: pointer; }
+.workspace-main .import-table tbody tr:hover { background: rgba(255,255,255,.03); }
 .workspace-struct-list { display: flex; flex-direction: column; gap: 8px; }
 .workspace-struct-row {
   display: flex; justify-content: space-between; gap: 12px; padding: 10px 12px;

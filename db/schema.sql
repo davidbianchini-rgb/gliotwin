@@ -127,6 +127,20 @@ CREATE TABLE IF NOT EXISTS subject_external_refs (
     UNIQUE(subject_id, source_system, ref_type)
 );
 
+CREATE TABLE IF NOT EXISTS subject_aliases (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject_id          INTEGER NOT NULL REFERENCES subjects(id) ON DELETE CASCADE,
+    source_system       TEXT    NOT NULL,
+    alias_type          TEXT    NOT NULL,
+    alias_value         TEXT    NOT NULL,
+    alias_norm          TEXT,
+    raw_value           TEXT,
+    created_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE(source_system, alias_type, alias_value),
+    UNIQUE(source_system, alias_type, alias_norm)
+);
+
 CREATE TABLE IF NOT EXISTS radiotherapy_courses (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     subject_id          INTEGER NOT NULL REFERENCES subjects(id) ON DELETE CASCADE,

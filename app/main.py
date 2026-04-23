@@ -6,7 +6,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.db import db, init_db, rows_as_dicts
-from app.routers import files, imports, patients, sessions, workspace, rhglioseg
+from app.routers import files, imports, patients, sessions, workspace, rhglioseg, fetsseg
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -38,6 +38,7 @@ app.include_router(files.router,    prefix="/api")
 app.include_router(imports.router,  prefix="/api")
 app.include_router(workspace.router,  prefix="/api")
 app.include_router(rhglioseg.router,  prefix="/api")
+app.include_router(fetsseg.router,    prefix="/api")
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 

@@ -3,10 +3,20 @@
 
 const SEG_MODELS = [
   {
+    key: 'fets_postop',
+    label: 'FeTS postop',
+    description: 'Tumor segmentation FeTS su casi gia preprocessati',
+    requires_preprocessing: true,
+    run_endpoint: '/api/fetsseg/run',
+    status_endpoint: '/api/fetsseg/status',
+  },
+  {
     key: 'rh-glioseg-v3',
     label: 'rh-GlioSeg v3',
     description: 'nnUNet 5-fold ensemble · Dataset016_RH-GlioSeg_v3',
     requires_preprocessing: true,
+    run_endpoint: '/api/rhglioseg/run',
+    status_endpoint: '/api/rhglioseg/status',
   },
 ];
 
@@ -14,10 +24,10 @@ const SegView = {
   state: {
     sessions: [],
     selected: {},        // session_id → bool
-    selectedModel: 'rh-glioseg-v3',
+    selectedModel: 'fets_postop',
     filterPreproc: false,
     filterQ: '',
-    jobStatus: null,
+    jobStatus: {},
     pollTimer: null,
     loading: true,
   },
@@ -45,28 +55,30 @@ const SegView = {
   async load() {
     this.state.loading = true;
     this.render();
-    const [sessions, jobStatus] = await Promise.all([
+    const [sessions, ...statuses] = await Promise.all([
       GlioTwin.fetch('/api/segmentation/sessions'),
-      GlioTwin.fetch('/api/rhglioseg/status').catch(() => null),
+      ...SEG_MODELS.map(model => GlioTwin.fetch(model.status_endpoint).catch(() => null)),
     ]);
     this.state.sessions  = sessions.sessions || [];
-    this.state.jobStatus = jobStatus;
+    this.state.jobStatus = Object.fromEntries(SEG_MODELS.map((model, index) => [model.key, statuses[index]]));
     this.state.loading   = false;
     this.render();
-    if (jobStatus?.running) this._startPoll();
+    if (statuses.some(status => status?.running)) this._startPoll();
   },
 
   async refreshStatus() {
-    const s = await GlioTwin.fetch('/api/rhglioseg/status').catch(() => null);
-    this.state.jobStatus = s;
-    return s;
+    const statuses = await Promise.all(
+      SEG_MODELS.map(model => GlioTwin.fetch(model.status_endpoint).catch(() => null))
+    );
+    this.state.jobStatus = Object.fromEntries(SEG_MODELS.map((model, index) => [model.key, statuses[index]]));
+    return this.state.jobStatus;
   },
 
   _startPoll() {
     clearTimeout(this.state.pollTimer);
     this.state.pollTimer = setTimeout(async () => {
-      const s = await this.refreshStatus();
-      if (s?.running) {
+      const statuses = await this.refreshStatus();
+      if (Object.values(statuses || {}).some(s => s?.running)) {
         this._startPoll();
       } else {
         const sessions = await GlioTwin.fetch('/api/segmentation/sessions').catch(() => null);
@@ -78,13 +90,18 @@ const SegView = {
 
   async runSelected() {
     const ids = this.selectedIds();
+    const model = this.modelInfo();
+    const modelStatus = this.state.jobStatus?.[model.key];
     if (!ids.length) { GlioTwin.toast('Seleziona almeno una sessione', 'error'); return; }
-    if (this.state.jobStatus?.running) { GlioTwin.toast('Segmentazione già in corso', 'error'); return; }
+    if (modelStatus?.running) { GlioTwin.toast('Segmentazione già in corso per questo modello', 'error'); return; }
     try {
-      await GlioTwin.post('/api/rhglioseg/run', { session_ids: ids, force: false });
+      await GlioTwin.post(model.run_endpoint, { session_ids: ids, force: false });
       GlioTwin.toast(`Avviata segmentazione su ${ids.length} sessione/i`, 'info');
       this.state.selected = {};
-      this.state.jobStatus = { running: true, current: 0, total: ids.length, last_msg: 'Avvio…' };
+      this.state.jobStatus = {
+        ...this.state.jobStatus,
+        [model.key]: { running: true, current: 0, total: ids.length, last_msg: 'Avvio…' },
+      };
       this.render();
       this._startPoll();
     } catch (e) { GlioTwin.toast(e.message, 'error'); }
@@ -125,7 +142,7 @@ const SegView = {
     const app = document.getElementById('app');
     if (!app) return;
 
-    const job    = this.state.jobStatus;
+    const job    = this.state.jobStatus?.[this.state.selectedModel];
     const rows   = this.filtered();
     const selIds = this.selectedIds();
     const allChecked = rows.length > 0 && rows.every(s => this.state.selected[s.session_id]);

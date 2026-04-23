@@ -1,15 +1,19 @@
 import json
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 from fastapi import HTTPException
 
 from app.db import db
 from app.services.pipeline_state import update_step
+from app.services.import_scan import _image_type_values, _read_anchor
 
 APT_CONVERTER_PYTHON = Path("/home/irst/miniconda3/envs/fets-env/bin/python")
 APT_REGISTER_SCRIPT  = Path(__file__).resolve().parents[2] / "pipelines" / "register_apt_to_reference.py"
+APT_CONVERTER_SCRIPT = Path(__file__).resolve().parents[2] / "pipelines" / "convert_apt_dicom.py"
+APT_IMPORT_ROOT = Path(__file__).resolve().parents[2] / "processed" / "imported_sequences"
 
 FINAL_ROOT = Path("/mnt/dati/irst_data/irst_preprocessed_final")
 
@@ -72,6 +76,31 @@ def _resolve_brain_dir(run_dir: Path) -> Path:
     raise HTTPException(400, f"FeTS brain output not found in {run_dir}")
 
 
+def _resolve_output_subject_id(run_path: Path, expected_subject_id: str, session_label: str) -> str:
+    candidates = []
+    for root in (
+        run_path / "output" / "tumor_extracted" / "DataForFeTS",
+        run_path / "output" / "brain_extracted" / "DataForFeTS",
+        run_path / "output" / "DataForFeTS",
+        run_path / "output" / "brain_extracted" / "DataForQC",
+        run_path / "output" / "prepared" / "DataForQC",
+    ):
+        if not root.exists():
+            continue
+        direct = root / expected_subject_id / session_label
+        if direct.exists():
+            return expected_subject_id
+        for session_dir in root.glob(f"*/{session_label}"):
+            if session_dir.is_dir():
+                candidates.append(session_dir.parent.name)
+    unique = sorted(set(candidates))
+    if len(unique) == 1:
+        return unique[0]
+    if expected_subject_id in unique:
+        return expected_subject_id
+    raise HTTPException(400, f"Unable to resolve FeTS output subject for {expected_subject_id}/{session_label}: {unique}")
+
+
 def _resolve_run_path(run_dir: str | Path, subject_id: str) -> Path:
     run_path = Path(run_dir).expanduser().resolve()
     if not run_path.exists():
@@ -84,7 +113,7 @@ def _resolve_run_path(run_dir: str | Path, subject_id: str) -> Path:
     return run_path
 
 
-def _resolve_mask_path(run_dir: Path, case_id: str) -> Path:
+def _resolve_mask_path(run_dir: Path, case_id: str, session_label: str, output_subject_id: str | None = None) -> Path:
     candidates = [
         run_dir / "output_labels" / f"{case_id}.nii.gz",
         run_dir / "output_labels" / f"{case_id}_tumorMask.nii.gz",
@@ -99,18 +128,22 @@ def _resolve_mask_path(run_dir: Path, case_id: str) -> Path:
         for candidate in sorted(tumor_masks.glob(f"*/{case_id.split('-', 1)[1]}/TumorMasksForQC/*tumorMask*.nii.gz")):
             if candidate.exists():
                 return candidate
+        if output_subject_id:
+            for candidate in sorted((tumor_masks / output_subject_id / session_label / "TumorMasksForQC").glob("*tumorMask*.nii.gz")):
+                if candidate.exists():
+                    return candidate
     raise HTTPException(400, f"FeTS segmentation output not found for {case_id}")
 
 
-def _brain_output_path(run_path: Path, subject_id: str, session_label: str, sequence_type: str) -> Path:
+def _brain_output_path(run_path: Path, output_subject_id: str, session_label: str, sequence_type: str) -> Path:
     official_suffix = SEQUENCE_TARGETS[sequence_type]
     qc_suffix = QC_REORIENTED_NAMES[sequence_type]
     candidates = [
-        run_path / "output" / "tumor_extracted" / "DataForFeTS" / subject_id / session_label / f"{subject_id}_{session_label}{official_suffix}",
-        run_path / "output" / "brain_extracted" / "DataForFeTS" / subject_id / session_label / f"{subject_id}_{session_label}{official_suffix}",
-        run_path / "output" / "DataForFeTS" / subject_id / session_label / f"{subject_id}_{session_label}{official_suffix}",
-        run_path / "output" / "brain_extracted" / "DataForQC" / subject_id / session_label / "reoriented" / f"{subject_id}_{session_label}{qc_suffix}",
-        run_path / "output" / "prepared" / "DataForQC" / subject_id / session_label / "reoriented" / f"{subject_id}_{session_label}{qc_suffix}",
+        run_path / "output" / "tumor_extracted" / "DataForFeTS" / output_subject_id / session_label / f"{output_subject_id}_{session_label}{official_suffix}",
+        run_path / "output" / "brain_extracted" / "DataForFeTS" / output_subject_id / session_label / f"{output_subject_id}_{session_label}{official_suffix}",
+        run_path / "output" / "DataForFeTS" / output_subject_id / session_label / f"{output_subject_id}_{session_label}{official_suffix}",
+        run_path / "output" / "brain_extracted" / "DataForQC" / output_subject_id / session_label / "reoriented" / f"{output_subject_id}_{session_label}{qc_suffix}",
+        run_path / "output" / "prepared" / "DataForQC" / output_subject_id / session_label / "reoriented" / f"{output_subject_id}_{session_label}{qc_suffix}",
     ]
     for candidate in candidates:
         if candidate.exists():
@@ -141,30 +174,78 @@ def _mask_volumes(mask_path: Path) -> dict[int, float]:
     return out
 
 
-def _find_t1ce_prepared(run_root: Path, subject_id: str, session_label: str) -> Path | None:
+def _find_t1ce_prepared(run_root: Path, output_subject_id: str, session_label: str) -> Path | None:
     """Return the non-skull-stripped T1ce in FeTS canonical space (prepared step output)."""
     candidates = [
-        run_root / "output" / "prepared" / "DataForQC" / subject_id / f".{session_label}" / "reoriented" / f"{subject_id}_{session_label}_t1c.nii.gz",
-        run_root / "output" / "prepared" / "DataForQC" / subject_id / session_label       / "reoriented" / f"{subject_id}_{session_label}_t1c.nii.gz",
-        run_root / "output" / "brain_extracted" / "DataForQC" / subject_id / session_label / "reoriented" / f"{subject_id}_{session_label}_t1c.nii.gz",
+        run_root / "output" / "prepared" / "DataForQC" / output_subject_id / f".{session_label}" / "reoriented" / f"{output_subject_id}_{session_label}_t1c.nii.gz",
+        run_root / "output" / "prepared" / "DataForQC" / output_subject_id / session_label       / "reoriented" / f"{output_subject_id}_{session_label}_t1c.nii.gz",
+        run_root / "output" / "brain_extracted" / "DataForQC" / output_subject_id / session_label / "reoriented" / f"{output_subject_id}_{session_label}_t1c.nii.gz",
     ]
     return next((c for c in candidates if c.exists()), None)
 
 
+def _link_or_copy(src: Path, dst: Path) -> None:
+    try:
+        dst.symlink_to(src)
+    except Exception:
+        shutil.copy2(src, dst)
+
+
+def _convert_apt_raw_to_native(raw_path: str, output_path: Path) -> tuple[str | None, str | None]:
+    source_dir = Path(raw_path)
+    if not source_dir.exists():
+        return None, f"APT source directory not found: {source_dir}"
+
+    selected_files: list[Path] = []
+    for dicom_path in sorted(source_dir.iterdir()):
+        if not dicom_path.is_file():
+            continue
+        ds = _read_anchor(dicom_path)
+        if ds is None:
+            continue
+        image_type = _image_type_values(ds)
+        if any("APTW" in str(item).upper() for item in image_type):
+            selected_files.append(dicom_path)
+
+    if not selected_files:
+        return None, "No APTW instances found in APT series"
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="gliotwin_apt_", dir="/tmp") as tmp_dir:
+        subset_dir = Path(tmp_dir) / "aptw_subset"
+        subset_dir.mkdir(parents=True, exist_ok=True)
+        for dicom_path in selected_files:
+            _link_or_copy(dicom_path, subset_dir / dicom_path.name)
+
+        cmd = [
+            str(APT_CONVERTER_PYTHON),
+            str(APT_CONVERTER_SCRIPT),
+            "--input-dir",
+            str(subset_dir),
+            "--output-img",
+            str(output_path),
+        ]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
+        if proc.returncode != 0:
+            error = (proc.stderr or proc.stdout or "").strip() or f"APT converter failed with exit code {proc.returncode}"
+            return None, error
+    return str(output_path), None
+
+
 def _finalize_apt_sequences(conn, session_id: int, t1ce_raw_dicom: str, run_root: Path,
-                             subject_id: str, session_label: str) -> list[dict]:
+                             subject_id: str, session_label: str, output_subject_id: str) -> list[dict]:
     """Register APT from native DICOM space into FeTS canonical space.
 
     Uses T1ce_prepared (canonical, with skull) as fixed and T1ce_native (DICOM,
     with skull) as moving — same modality, same skull content → NCC affine.
     Saves the transform to disk for traceability.
     """
-    t1ce_prepared = _find_t1ce_prepared(run_root, subject_id, session_label)
+    t1ce_prepared = _find_t1ce_prepared(run_root, output_subject_id, session_label)
     if t1ce_prepared is None:
         return [{"status": "skipped", "reason": "T1ce prepared not found"}]
 
     rows = conn.execute(
-        "SELECT id, metadata_json FROM sequences WHERE session_id = ? AND sequence_type = 'APT'",
+        "SELECT id, raw_path, metadata_json FROM sequences WHERE session_id = ? AND sequence_type = 'APT'",
         (session_id,),
     ).fetchall()
     results = []
@@ -173,8 +254,22 @@ def _finalize_apt_sequences(conn, session_id: int, t1ce_raw_dicom: str, run_root
         metadata = json.loads(row["metadata_json"] or "{}")
         apt_native = metadata.get("apt_native_path")
         if not apt_native or not Path(apt_native).exists():
-            results.append({"seq_id": seq_id, "status": "skipped", "reason": "apt_native_path missing"})
-            continue
+            raw_path = row["raw_path"]
+            if not raw_path:
+                results.append({"seq_id": seq_id, "status": "skipped", "reason": "apt raw_path missing"})
+                continue
+            series_uid = str(metadata.get("series_instance_uid") or "apt").replace(".", "_")
+            apt_native_path_guess = APT_IMPORT_ROOT / subject_id / session_label / "apt" / f"{subject_id}_{session_label}_{series_uid}_aptw.nii.gz"
+            apt_native, convert_error = _convert_apt_raw_to_native(raw_path, apt_native_path_guess)
+            metadata["apt_native_path"] = apt_native
+            metadata["apt_conversion_error"] = convert_error
+            if not apt_native:
+                conn.execute(
+                    "UPDATE sequences SET metadata_json = ? WHERE id = ?",
+                    (json.dumps(metadata, ensure_ascii=True), seq_id),
+                )
+                results.append({"seq_id": seq_id, "status": "failed", "error": convert_error or "APT conversion failed"})
+                continue
 
         apt_native_path = Path(apt_native)
         stem            = apt_native_path.name.replace("_aptw.nii.gz", "")
@@ -223,13 +318,14 @@ def finalize_fets_run(session_id: int, run_dir: str) -> dict:
         session_label = session_info["session_label"]
         case_id = f"{subject_id}-{session_label}"
         seq_ids = _find_sequence_ids(conn, session_id)
+        output_subject_id = _resolve_output_subject_id(run_path, subject_id, session_label)
 
         missing_sequences = [seq_type for seq_type in SEQUENCE_TARGETS if seq_type not in seq_ids]
         if missing_sequences:
             raise HTTPException(400, f"Missing raw sequences in DB for session {session_id}: {', '.join(missing_sequences)}")
 
         brain_root = _resolve_brain_dir(run_path)
-        brain_case_dir = brain_root / subject_id / session_label
+        brain_case_dir = brain_root / output_subject_id / session_label
         if not brain_case_dir.exists():
             raise HTTPException(400, f"FeTS case folder not found: {brain_case_dir}")
 
@@ -237,7 +333,7 @@ def finalize_fets_run(session_id: int, run_dir: str) -> dict:
         copied_sequences = []
 
         for sequence_type, suffix in SEQUENCE_TARGETS.items():
-            src = brain_case_dir / f"{subject_id}_{session_label}{suffix}"
+            src = brain_case_dir / f"{output_subject_id}_{session_label}{suffix}"
             if not src.exists():
                 raise HTTPException(400, f"Missing FeTS output file: {src}")
             dst = final_dir / src.name
@@ -277,10 +373,10 @@ def finalize_fets_run(session_id: int, run_dir: str) -> dict:
         if t1ce_raw_path and t1ce_raw_path["raw_path"]:
             apt_results = _finalize_apt_sequences(
                 conn, session_id, t1ce_raw_path["raw_path"],
-                run_path, subject_id, session_label,
+                run_path, subject_id, session_label, output_subject_id,
             )
 
-        seg_src = _resolve_mask_path(run_path, case_id)
+        seg_src = _resolve_mask_path(run_path, case_id, session_label, output_subject_id)
         seg_dst = final_dir / f"{subject_id}_{session_label}_tumorMask.nii.gz"
         seg_path = _copy_file(seg_src, seg_dst)
         volumes = _mask_volumes(seg_dst)
@@ -367,6 +463,7 @@ def sync_fets_outputs(session_id: int, run_dir: str) -> dict:
         case_id = f"{subject_id}-{session_label}"
         seq_ids = _find_sequence_ids(conn, session_id)
         run_path = _resolve_run_path(run_dir, subject_id)
+        output_subject_id = _resolve_output_subject_id(run_path, subject_id, session_label)
 
         missing_sequences = [seq_type for seq_type in SEQUENCE_TARGETS if seq_type not in seq_ids]
         if missing_sequences:
@@ -375,7 +472,7 @@ def sync_fets_outputs(session_id: int, run_dir: str) -> dict:
         brain_outputs = []
         processed_dir = None
         for sequence_type in SEQUENCE_TARGETS:
-            src = _brain_output_path(run_path, subject_id, session_label, sequence_type)
+            src = _brain_output_path(run_path, output_subject_id, session_label, sequence_type)
             processed_dir = str(src.parent)
             hdr = {}
             try:
@@ -412,10 +509,10 @@ def sync_fets_outputs(session_id: int, run_dir: str) -> dict:
         if t1ce_raw_row and t1ce_raw_row["raw_path"]:
             apt_results = _finalize_apt_sequences(
                 conn, session_id, t1ce_raw_row["raw_path"],
-                run_path, subject_id, session_label,
+                run_path, subject_id, session_label, output_subject_id,
             )
 
-        seg_src = _resolve_mask_path(run_path, case_id)
+        seg_src = _resolve_mask_path(run_path, case_id, session_label, output_subject_id)
         volumes = _mask_volumes(seg_src)
 
         conn.execute(
@@ -464,6 +561,7 @@ def sync_fets_brain_outputs(session_id: int, run_dir: str) -> dict:
         session_label = session_info["session_label"]
         seq_ids = _find_sequence_ids(conn, session_id)
         run_path = _resolve_run_path(run_dir, subject_id)
+        output_subject_id = _resolve_output_subject_id(run_path, subject_id, session_label)
 
         missing_sequences = [seq_type for seq_type in SEQUENCE_TARGETS if seq_type not in seq_ids]
         if missing_sequences:
@@ -472,7 +570,7 @@ def sync_fets_brain_outputs(session_id: int, run_dir: str) -> dict:
         brain_outputs = []
         processed_dir = None
         for sequence_type in SEQUENCE_TARGETS:
-            src = _brain_output_path(run_path, subject_id, session_label, sequence_type)
+            src = _brain_output_path(run_path, output_subject_id, session_label, sequence_type)
             processed_dir = str(src.parent)
             hdr = {}
             try:

@@ -220,7 +220,6 @@ const GlioTwin = {
     if (!this.state.showSensitive) return '';
     const details = [];
     if (item?.study_date) details.push(this.fmtDate(item.study_date));
-    if (item?.study_time) details.push(item.study_time);
     return details.join(' · ');
   },
 

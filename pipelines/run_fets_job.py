@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.services.fets_finalize import sync_fets_outputs
+from app.services.fets_finalize import sync_fets_brain_outputs
 from app.services.processing_jobs import dispatch_next_job
 from app.services.pipeline_state import ensure_state, update_step
 
@@ -149,6 +149,7 @@ def main() -> int:
     job_root = INPUT_ROOT / f"job_{job_id:05d}"
     job_root.mkdir(parents=True, exist_ok=True)
     worker_log = job_root / "worker.log"
+    worker_log.write_text("", encoding="utf-8")
 
     try:
         case = session_payload(conn, job_id)
@@ -170,17 +171,6 @@ def main() -> int:
         with worker_log.open("a", encoding="utf-8") as log:
             log.write(f"[job {job_id}] prepare_input\n")
             input_root = prepare_input(case, job_root)
-            update_step(
-                case["subject_id"],
-                case["session_label"],
-                "initial_validation",
-                status="running",
-                output_path=str(job_root / "input"),
-                error_message=None,
-                started=True,
-                session_id=case["session_id"],
-                dataset="irst_dicom_raw",
-            )
             run_root = job_root / "runs"
             run_root.mkdir(parents=True, exist_ok=True)
             update_job(conn, job_id, progress_stage="running_fets")
@@ -192,6 +182,8 @@ def main() -> int:
                 str(input_root),
                 "--output",
                 str(run_root),
+                "--mode",
+                "brain",
             ]
             if USE_GPU:
                 cmd.extend(["--gpu", GPU_ID])
@@ -241,19 +233,7 @@ def main() -> int:
                 session_id=case["session_id"],
                 dataset="irst_dicom_raw",
             )
-            update_step(
-                case["subject_id"],
-                case["session_label"],
-                "tumor_segmentation",
-                status="done",
-                output_path=str(run_dir / "output_labels"),
-                error_message=None,
-                started=True,
-                finished=True,
-                session_id=case["session_id"],
-                dataset="irst_dicom_raw",
-            )
-            sync_result = sync_fets_outputs(case["session_id"], str(run_dir))
+            sync_result = sync_fets_brain_outputs(case["session_id"], str(run_dir))
             update_job(
                 conn,
                 job_id,

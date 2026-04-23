@@ -12,6 +12,13 @@ import pandas as pd
 from fastapi import HTTPException
 
 from app.db import db, rows_as_dicts
+from app.services.subject_identity import (
+    add_subject_alias,
+    create_subject,
+    find_subject_by_alias,
+    normalize_person_key,
+    update_subject_demographics,
+)
 
 ALLOWED_IMPORT_ROOTS = [
     Path("/mnt/dati"),
@@ -181,7 +188,7 @@ def _subject_name_keys(subject: dict[str, Any]) -> set[str]:
     return {item for item in keys if item}
 
 
-def _candidate_subjects(dataset: str | None = None) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+def _candidate_subjects(dataset: str | None = None) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]], dict[tuple[str, str], list[dict[str, Any]]]]:
     with db() as conn:
         if dataset:
             rows = conn.execute(
@@ -201,23 +208,68 @@ def _candidate_subjects(dataset: str | None = None) -> tuple[list[dict[str, Any]
                 ORDER BY dataset, patient_family_name, patient_given_name, subject_id
                 """
             ).fetchall()
+        alias_rows = conn.execute(
+            f"""
+            SELECT sa.*, s.dataset, s.subject_id AS internal_subject_id
+            FROM subject_aliases sa
+            JOIN subjects s ON s.id = sa.subject_id
+            {"WHERE s.dataset = ?" if dataset else ""}
+            ORDER BY sa.subject_id
+            """,
+            ((dataset,) if dataset else ()),
+        ).fetchall()
     subjects = rows_as_dicts(rows)
     name_index: dict[str, list[dict[str, Any]]] = {}
+    alias_index: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for subject in subjects:
         for key in _subject_name_keys(subject):
             name_index.setdefault(key, []).append(subject)
-    return subjects, name_index
+    for alias in rows_as_dicts(alias_rows):
+        key = (alias["alias_type"], _clean_string(alias.get("alias_value")) or _clean_string(alias.get("alias_norm")) or "")
+        if not key[1]:
+            continue
+        alias_index.setdefault(key, []).append(alias)
+    return subjects, name_index, alias_index
 
 
-def _match_row(row: RtRow, name_index: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+def _match_row(
+    row: RtRow,
+    name_index: dict[str, list[dict[str, Any]]],
+    alias_index: dict[tuple[str, str], list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+
+    alias_keys = []
+    if row.ida:
+        alias_keys.append(("rt_ida", row.ida))
+    if row.tax_code:
+        alias_keys.append(("tax_code", row.tax_code))
+    person_key = normalize_person_key(row.patient_family_name, row.patient_given_name)
+    if person_key:
+        alias_keys.append(("person_key", person_key))
+
+    for alias_type, alias_value in alias_keys:
+        for alias in alias_index.get((alias_type, alias_value), []):
+            subject_id = int(alias["subject_id"])
+            if subject_id in seen_ids:
+                continue
+            subject = {
+                "id": alias["subject_id"],
+                "subject_id": alias["internal_subject_id"],
+                "dataset": alias["dataset"],
+            }
+            matches.append(subject)
+            seen_ids.add(subject_id)
+
+    if matches:
+        return matches
+
     keys = []
     if row.patient_family_name or row.patient_given_name:
         keys.append(_canonical_name(row.patient_family_name, row.patient_given_name))
         keys.append(_canonical_name(row.patient_given_name, row.patient_family_name))
     keys.append(_normalize_text(row.patient_name_raw))
-
-    matches: list[dict[str, Any]] = []
-    seen_ids: set[int] = set()
     for key in keys:
         for subject in name_index.get(key, []):
             subject_id = int(subject["id"])
@@ -231,7 +283,7 @@ def _match_row(row: RtRow, name_index: dict[str, list[dict[str, Any]]]) -> list[
 def analyze_rt_excel(file_path: str, dataset: str = DEFAULT_RT_DATASET) -> dict[str, Any]:
     resolved = _resolve_excel_path(file_path)
     rows = _read_excel_rows(resolved)
-    subjects, name_index = _candidate_subjects(dataset=dataset)
+    subjects, name_index, alias_index = _candidate_subjects(dataset=dataset)
 
     preview_rows: list[dict[str, Any]] = []
     matched = 0
@@ -239,7 +291,7 @@ def analyze_rt_excel(file_path: str, dataset: str = DEFAULT_RT_DATASET) -> dict[
     unmatched = 0
 
     for row in rows:
-        candidates = _match_row(row, name_index)
+        candidates = _match_row(row, name_index, alias_index)
         if len(candidates) == 1:
             status = "matched"
             matched += 1
@@ -345,6 +397,94 @@ def _update_subject_from_rt(conn, subject: dict[str, Any], row: RtRow) -> None:
             f"UPDATE subjects SET {assignments}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?",
             values,
         )
+
+
+def _resolve_or_create_subject_from_rt(conn, row: RtRow, dataset: str, source_file: str) -> dict[str, Any]:
+    person_key = normalize_person_key(row.patient_family_name, row.patient_given_name)
+    subject_row = None
+    if row.ida:
+        subject_row = find_subject_by_alias(
+            conn,
+            source_system="mosaiq_rt",
+            alias_type="rt_ida",
+            alias_value=row.ida,
+            dataset=dataset,
+        )
+    if subject_row is None and row.tax_code:
+        subject_row = find_subject_by_alias(
+            conn,
+            source_system="identity",
+            alias_type="tax_code",
+            alias_value=row.tax_code,
+            dataset=dataset,
+        )
+    if subject_row is None and person_key:
+        subject_row = find_subject_by_alias(
+            conn,
+            source_system="identity",
+            alias_type="person_key",
+            alias_norm=person_key,
+            dataset=dataset,
+        )
+    if subject_row is None:
+        subject_pk = create_subject(
+            conn,
+            dataset,
+            patient_name=f"{row.patient_given_name} {row.patient_family_name}".strip() or row.patient_name_raw,
+            patient_given_name=row.patient_given_name or None,
+            patient_family_name=row.patient_family_name or None,
+            notes=f"Imported from RT file {Path(source_file).name}",
+        )
+        subject_row = conn.execute("SELECT * FROM subjects WHERE id = ?", (subject_pk,)).fetchone()
+
+    subject_dict = dict(subject_row)
+    update_subject_demographics(
+        conn,
+        int(subject_dict["id"]),
+        patient_name=f"{row.patient_given_name} {row.patient_family_name}".strip() or row.patient_name_raw,
+        patient_given_name=row.patient_given_name or None,
+        patient_family_name=row.patient_family_name or None,
+        notes=f"Imported from RT file {Path(source_file).name}",
+    )
+    add_subject_alias(
+        conn,
+        int(subject_dict["id"]),
+        source_system="mosaiq_rt",
+        alias_type="rt_patient_name",
+        alias_value=_canonical_name(row.patient_family_name, row.patient_given_name),
+        alias_norm=person_key,
+        raw_value=row.patient_name_raw,
+    )
+    if person_key:
+        add_subject_alias(
+            conn,
+            int(subject_dict["id"]),
+            source_system="identity",
+            alias_type="person_key",
+            alias_value=person_key,
+            alias_norm=person_key,
+            raw_value=row.patient_name_raw,
+        )
+    if row.ida:
+        add_subject_alias(
+            conn,
+            int(subject_dict["id"]),
+            source_system="mosaiq_rt",
+            alias_type="rt_ida",
+            alias_value=row.ida,
+            raw_value=row.ida,
+        )
+    if row.tax_code:
+        add_subject_alias(
+            conn,
+            int(subject_dict["id"]),
+            source_system="identity",
+            alias_type="tax_code",
+            alias_value=row.tax_code,
+            raw_value=row.tax_code,
+        )
+    refreshed = conn.execute("SELECT * FROM subjects WHERE id = ?", (int(subject_dict["id"]),)).fetchone()
+    return dict(refreshed)
 
 
 def _upsert_subject_ref(conn, subject_id: int, ref_type: str, ref_value: str | None, raw_value: str | None) -> None:
@@ -520,21 +660,21 @@ def commit_rt_excel(file_path: str, dataset: str = DEFAULT_RT_DATASET) -> dict[s
             if status == "ambiguous":
                 skipped_ambiguous += 1
                 continue
-            if status == "unmatched":
-                skipped_unmatched += 1
-                continue
 
-            subject = preview["candidates"][0]
             source_row = source_rows[preview["row_index"]]
-            subject_row = conn.execute(
-                "SELECT * FROM subjects WHERE id = ?",
-                (subject["id"],),
-            ).fetchone()
-            if not subject_row:
-                skipped_unmatched += 1
-                continue
+            if status == "matched":
+                subject = preview["candidates"][0]
+                subject_row = conn.execute(
+                    "SELECT * FROM subjects WHERE id = ?",
+                    (subject["id"],),
+                ).fetchone()
+                if not subject_row:
+                    skipped_unmatched += 1
+                    continue
+                subject_dict = dict(subject_row)
+            else:
+                subject_dict = _resolve_or_create_subject_from_rt(conn, source_row, dataset, resolved)
 
-            subject_dict = dict(subject_row)
             _update_subject_from_rt(conn, subject_dict, source_row)
             _upsert_subject_ref(conn, subject_dict["id"], "ida", source_row.ida, source_row.ida)
             _upsert_subject_ref(conn, subject_dict["id"], "tax_code", source_row.tax_code, source_row.tax_code)

@@ -14,6 +14,7 @@ router = APIRouter(tags=["import"])
 class ImportScanRequest(BaseModel):
     root_path: str = Field(..., description="Absolute path to the DICOM root on server")
     limit_studies: int | None = Field(default=None, ge=1, le=2000)
+    requested_structures: List[str] = Field(default_factory=list)
 
 
 class ImportCommitRequest(BaseModel):
