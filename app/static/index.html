@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GlioTwin</title>
+  <link rel="stylesheet" href="/static/style.css?v=20260420d" />
+</head>
+<body>
+  <aside id="sidebar" class="shell-sidebar">
+    <div class="sidebar-logo shell-logo">
+      <span class="logo-icon" title="GlioTwin">⬡</span>
+    </div>
+    <nav class="sidebar-nav shell-nav">
+      <a href="#/browser" class="nav-item active shell-nav-item" data-view="browser" title="Viewer">
+        <span class="shell-nav-icon">◫</span>
+        <span class="shell-nav-label">Viewer</span>
+      </a>
+      <div class="nav-phase-divider"></div>
+      <a href="#/import" class="nav-item shell-nav-item" data-view="import" title="Import">
+        <span class="shell-nav-icon">⇪</span>
+        <span class="shell-nav-label">Import</span>
+      </a>
+      <a href="#/workspace" class="nav-item shell-nav-item" data-view="workspace" title="Preprocessing">
+        <span class="shell-nav-icon">▣</span>
+        <span class="shell-nav-label">Preprocessing</span>
+      </a>
+      <a href="#/rhglioseg" class="nav-item shell-nav-item" data-view="rhglioseg" title="Segmentation">
+        <span class="shell-nav-icon">⬡</span>
+        <span class="shell-nav-label">Segmentation</span>
+      </a>
+      <a href="#/analysis" class="nav-item shell-nav-item" data-view="analysis" title="Analysis">
+        <span class="shell-nav-icon">◈</span>
+        <span class="shell-nav-label">Analysis</span>
+      </a>
+      <a href="#/export" class="nav-item shell-nav-item" data-view="export" title="Export">
+        <span class="shell-nav-icon">↓</span>
+        <span class="shell-nav-label">Export</span>
+      </a>
+    </nav>
+    <div class="sidebar-footer" style="padding:10px;flex-direction:column;gap:4px;align-items:center">
+      <span id="db-status" class="status-dot ok" title="SQLite · local"></span>
+      <button id="phi-toggle" class="phi-toggle" type="button" title="Mostra o nasconde i dati sensibili DICOM">PHI Off</button>
+    </div>
+  </aside>
+
+  <main id="app">
+    <div class="loading-screen">
+      <div class="spinner"></div>
+      <p>Loading GlioTwin…</p>
+    </div>
+  </main>
+
+  <script src="https://unpkg.com/@niivue/niivue@latest/dist/niivue.umd.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  <script src="/static/app.js?v=20260423a"></script>
+  <script src="/static/viewer.js?v=20260420b"></script>
+  <script src="/static/views/dashboard.js?v=20260423b"></script>
+  <script src="/static/views/import.js?v=20260423a"></script>
+  <script src="/static/views/patient.js?v=20260415c"></script>
+  <script src="/static/views/workspace.js?v=20260423b"></script>
+  <script src="/static/views/global_metrics.js?v=20260423a"></script>
+  <script src="/static/views/rhglioseg.js?v=20260423c"></script>
+  <script src="/static/views/export.js?v=20260423a"></script>
+</body>
+</html>

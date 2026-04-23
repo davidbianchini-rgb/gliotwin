@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Local editor / tooling
+.DS_Store
+.idea/
+.vscode/
+.codex
+.codex/
+
+# Logs
+*.log
+nohup.out
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Large local data / generated outputs
+raw/
+processed/
+Dataset016_RH-GlioSeg_v3/
+
+# Runtime artifacts
+tmp/
