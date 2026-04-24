@@ -280,7 +280,7 @@ def _needs_brain_output_sync(conn, job: dict) -> bool:
     return any(not core_rows.get(sequence_type) for sequence_type in CORE_SEQUENCE_TYPES)
 
 
-def _sync_pipeline_state(job: dict) -> dict | None:
+def _sync_pipeline_state(conn, job: dict) -> dict | None:
     subject_id, session_label = _case_identity(job)
     if not subject_id or not session_label:
         return None
@@ -290,6 +290,7 @@ def _sync_pipeline_state(job: dict) -> dict | None:
         session_label,
         session_id=job.get("session_id"),
         dataset=TARGET_DATASET,
+        conn=conn,
     )
     status = job.get("status")
     stage = job.get("progress_stage")
@@ -313,6 +314,7 @@ def _sync_pipeline_state(job: dict) -> dict | None:
             finished_at_value=finished_at_value,
             session_id=job.get("session_id"),
             dataset=TARGET_DATASET,
+            conn=conn,
         )
 
     def mark_running(step_key: str, output_path: str | None = None, *, started_at_value: str | None = None) -> None:
@@ -328,6 +330,7 @@ def _sync_pipeline_state(job: dict) -> dict | None:
             started_at_value=started_at_value,
             session_id=job.get("session_id"),
             dataset=TARGET_DATASET,
+            conn=conn,
         )
 
     def mark_failed(step_key: str, output_path: str | None = None) -> None:
@@ -342,10 +345,11 @@ def _sync_pipeline_state(job: dict) -> dict | None:
             finished=True,
             session_id=job.get("session_id"),
             dataset=TARGET_DATASET,
+            conn=conn,
         )
 
     if status == "queued":
-        return load_state(subject_id, session_label)
+        return load_state(subject_id, session_label, conn=conn)
 
     if report and status == "running" and report.get("status_code") is not None:
         report_code = report["status_code"]
@@ -353,58 +357,58 @@ def _sync_pipeline_state(job: dict) -> dict | None:
         job_start = job.get("started_at")
         if report_code <= 0:
             mark_running("initial_validation", input_dir, started_at_value=job_start)
-            return load_state(subject_id, session_label)
+            return load_state(subject_id, session_label, conn=conn)
         if report_code == 1:
             mark_done("initial_validation", input_dir, started_at_value=job_start, finished_at_value=report_ts)
             mark_running("nifti_conversion", run_dir or input_dir, started_at_value=report_ts)
-            return load_state(subject_id, session_label)
+            return load_state(subject_id, session_label, conn=conn)
         if report_code == 2:
             mark_done("initial_validation", input_dir, started_at_value=job_start, finished_at_value=report_ts)
             mark_done("nifti_conversion", run_dir or input_dir, started_at_value=report_ts, finished_at_value=report_ts)
             mark_running("brain_extraction", run_dir, started_at_value=report_ts)
-            return load_state(subject_id, session_label)
+            return load_state(subject_id, session_label, conn=conn)
         if report_code >= 3:
             mark_done("initial_validation", input_dir, started_at_value=job_start, finished_at_value=report_ts)
             mark_done("nifti_conversion", run_dir or input_dir, started_at_value=report_ts, finished_at_value=report_ts)
             mark_done("brain_extraction", run_dir, started_at_value=report_ts, finished_at_value=report_ts)
-            return load_state(subject_id, session_label)
+            return load_state(subject_id, session_label, conn=conn)
 
     if stage in {"preparing_input", "queued", "running_fets"} and status == "running":
-        return load_state(subject_id, session_label)
+        return load_state(subject_id, session_label, conn=conn)
 
     if stage == "initial_validation":
         mark_running("initial_validation", run_dir or input_dir)
-        return load_state(subject_id, session_label)
+        return load_state(subject_id, session_label, conn=conn)
 
     if stage == "nifti_conversion":
         mark_done("initial_validation", input_dir)
         mark_running("nifti_conversion", run_dir or input_dir)
-        return load_state(subject_id, session_label)
+        return load_state(subject_id, session_label, conn=conn)
 
     if stage == "brain_extraction":
         mark_done("initial_validation", input_dir)
         mark_done("nifti_conversion", run_dir or input_dir)
         mark_running("brain_extraction", run_dir)
-        return load_state(subject_id, session_label)
+        return load_state(subject_id, session_label, conn=conn)
 
     if stage in {"brain_queue", "brain_inference"}:
         mark_done("initial_validation", input_dir)
         mark_done("nifti_conversion", run_dir or input_dir)
         mark_running("brain_extraction", run_dir)
-        return load_state(subject_id, session_label)
+        return load_state(subject_id, session_label, conn=conn)
 
     if stage in {"tumor_extraction", "tumor_preprocessing", "tumor_prediction"}:
         mark_done("initial_validation", input_dir)
         mark_done("nifti_conversion", run_dir)
         mark_done("brain_extraction", run_dir)
         mark_running("tumor_segmentation", run_dir)
-        return load_state(subject_id, session_label)
+        return load_state(subject_id, session_label, conn=conn)
 
     if status == "completed":
         mark_done("initial_validation", input_dir)
         mark_done("nifti_conversion", run_dir)
         mark_done("brain_extraction", run_dir)
-        return load_state(subject_id, session_label)
+        return load_state(subject_id, session_label, conn=conn)
 
     if status in {"failed", "cancelled"}:
         failed_step = "tumor_segmentation"
@@ -433,7 +437,7 @@ def _sync_pipeline_state(job: dict) -> dict | None:
             failed_step = "tumor_segmentation"
             output_path = run_dir
         mark_failed(failed_step, output_path)
-        return load_state(subject_id, session_label)
+        return load_state(subject_id, session_label, conn=conn)
 
     return state
 
@@ -644,7 +648,7 @@ def _sync_job_state(conn, job_row) -> dict:
             job["error_message"] = None
             job["finished_at"] = None
         job["progress_label"] = _stage_label(job.get("progress_stage"))
-        pipeline_state = _sync_pipeline_state(job)
+        pipeline_state = _sync_pipeline_state(conn, job)
         if pipeline_state:
             job["pipeline_state"] = pipeline_state
             job["pipeline_summary"] = pipeline_state_summary(pipeline_state)
@@ -653,7 +657,7 @@ def _sync_job_state(conn, job_row) -> dict:
     finalized = _finalize_completed_job(conn, job)
     if finalized is not None:
         finalized["progress_label"] = _stage_label(finalized.get("progress_stage"))
-        pipeline_state = _sync_pipeline_state(finalized)
+        pipeline_state = _sync_pipeline_state(conn, finalized)
         if pipeline_state:
             finalized["pipeline_state"] = pipeline_state
             finalized["pipeline_summary"] = pipeline_state_summary(pipeline_state)
@@ -661,7 +665,7 @@ def _sync_job_state(conn, job_row) -> dict:
 
     if job["status"] != "running":
         job["progress_label"] = _stage_label(job.get("progress_stage"))
-        pipeline_state = _sync_pipeline_state(job)
+        pipeline_state = _sync_pipeline_state(conn, job)
         if pipeline_state:
             job["pipeline_state"] = pipeline_state
             job["pipeline_summary"] = pipeline_state_summary(pipeline_state)
@@ -700,7 +704,7 @@ def _sync_job_state(conn, job_row) -> dict:
 
     updated = dict(conn.execute("SELECT * FROM processing_jobs WHERE id = ?", (job["id"],)).fetchone())
     updated["progress_label"] = _stage_label(updated.get("progress_stage"))
-    pipeline_state = _sync_pipeline_state(updated)
+    pipeline_state = _sync_pipeline_state(conn, updated)
     if pipeline_state:
         updated["pipeline_state"] = pipeline_state
         updated["pipeline_summary"] = pipeline_state_summary(pipeline_state)
@@ -757,6 +761,7 @@ def create_processing_job(session_id: int) -> dict:
             session["patient_code"],
             session["session_label"],
             ["initial_validation", "nifti_conversion", "brain_extraction", "tumor_segmentation"],
+            conn=conn,
         )
 
         conn.execute(
@@ -777,7 +782,7 @@ def create_processing_job(session_id: int) -> dict:
             "patient_given_name": session["patient_given_name"],
             "patient_family_name": session["patient_family_name"],
             "patient_birth_date": session["patient_birth_date"],
-            "pipeline_state": load_state(session["patient_code"], session["session_label"]),
+            "pipeline_state": load_state(session["patient_code"], session["session_label"], conn=conn),
         }
 
 
@@ -987,6 +992,7 @@ def stop_all_processing() -> dict:
                 job["patient_code"],
                 job["session_label"],
                 ["initial_validation", "nifti_conversion", "brain_extraction", "tumor_segmentation"],
+                conn=conn,
             )
             cleaned_sessions.append(f"{job['patient_code']}:{job['session_label']}")
         if cancelled:
@@ -1015,6 +1021,7 @@ def stop_all_processing() -> dict:
                 row["patient_code"],
                 row["session_label"],
                 ["initial_validation", "nifti_conversion", "brain_extraction", "tumor_segmentation"],
+                conn=conn,
             )
             cleaned_sessions.append(f"{row['patient_code']}:{row['session_label']}")
     return {

@@ -91,10 +91,14 @@ def segmentation_sessions():
     with db() as conn:
         rows = conn.execute("""
             SELECT
-                sub.id          AS patient_id,
+                sub.id                  AS patient_id,
                 sub.subject_id,
                 sub.dataset,
-                se.id           AS session_id,
+                sub.patient_name,
+                sub.patient_given_name,
+                sub.patient_family_name,
+                sub.patient_birth_date,
+                se.id                   AS session_id,
                 se.session_label,
                 se.timepoint_type,
                 se.days_from_baseline,

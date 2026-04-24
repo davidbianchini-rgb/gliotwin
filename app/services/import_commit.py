@@ -495,6 +495,7 @@ def commit_import_selection(
                     exam["timepoint_label"],
                     session_id=session_pk,
                     dataset=DATASET_NAME,
+                    conn=conn,
                 )
                 update_step(
                     internal_subject_id,
@@ -507,6 +508,7 @@ def commit_import_selection(
                     finished=True,
                     session_id=session_pk,
                     dataset=DATASET_NAME,
+                    conn=conn,
                 )
                 missing_core = [label for label, series in _selected_core(exam, core_choice).items() if not series]
                 if missing_core:
@@ -521,6 +523,7 @@ def commit_import_selection(
                         finished=True,
                         session_id=session_pk,
                         dataset=DATASET_NAME,
+                        conn=conn,
                     )
                 else:
                     update_step(
@@ -534,6 +537,7 @@ def commit_import_selection(
                         finished=True,
                         session_id=session_pk,
                         dataset=DATASET_NAME,
+                        conn=conn,
                     )
                 if imported_core:
                     reset_downstream_steps(
@@ -545,6 +549,7 @@ def commit_import_selection(
                             "brain_extraction",
                             "tumor_segmentation",
                         ],
+                        conn=conn,
                     )
                 result["imported_exam_keys"].append(exam["exam_key"])
                 result["imported_sessions"].append({

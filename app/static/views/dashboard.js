@@ -1089,38 +1089,245 @@ function _renderPatientEditorPanel() {
   }
   const latestRt = patient.latest_radiotherapy_course || {};
   const refs = patient.external_ref_map || {};
+  const diagnosisDate = patient.diagnosis_date || latestRt.diagnosis_date || null;
+  const fmtDay = (value) => value == null || value === '' ? '—' : `D+${value}`;
+  const parseIso = (value) => {
+    if (!value) return null;
+    const dt = new Date(value);
+    return Number.isNaN(dt.getTime()) ? null : dt;
+  };
+  const diffDays = (startValue, endValue) => {
+    const start = parseIso(startValue);
+    const end = parseIso(endValue);
+    if (!start || !end) return null;
+    return Math.round((end - start) / 86400000);
+  };
+  const relativeDays = (event) => {
+    if (event.days_from_baseline != null && event.days_from_baseline !== '') return Number(event.days_from_baseline);
+    return diffDays(diagnosisDate, event.event_date);
+  };
+  const eventLabel = (type) => ({
+    imaging_mr: 'MR',
+    imaging_pet: 'PET',
+    imaging_other: 'Imaging',
+    diagnosis: 'Diagnosis',
+    surgery: 'Surgery',
+    radiotherapy: 'Radiotherapy',
+    radiotherapy_start: 'Radiotherapy start',
+    radiotherapy_end: 'Radiotherapy end',
+    chemotherapy_start: 'Chemotherapy start',
+    chemotherapy_end: 'Chemotherapy end',
+    progression: 'Progression',
+    death: 'Death',
+    other: 'Other',
+  }[type] || String(type || 'event').replaceAll('_', ' '));
+  const imagingLabel = (session) => {
+    const hay = `${session.session_label || ''} ${session.timepoint_type || ''}`.toLowerCase();
+    if (hay.includes('pet')) return 'imaging_pet';
+    if (hay.includes('mr') || hay.includes('mri') || hay.includes('timepoint')) return 'imaging_mr';
+    if (['pre_op','post_op','follow_up','recurrence','other'].includes(session.timepoint_type)) return 'imaging_mr';
+    return 'imaging_other';
+  };
+  const buildEventRows = () => {
+    const items = [];
+    const rows = [...(patient.clinical_events || [])];
+    const used = new Set();
+    const firstUnused = (type) => rows.find((row, idx) => !used.has(idx) && row.event_type === type);
+    const markUsed = (row) => {
+      const idx = rows.indexOf(row);
+      if (idx >= 0) used.add(idx);
+    };
+    if (!rows.some((row) => row.event_type === 'diagnosis') && diagnosisDate) {
+      rows.push({
+        event_type: 'diagnosis',
+        event_date: diagnosisDate,
+        days_from_baseline: 0,
+        description: 'Derived from diagnosis date',
+      });
+    }
+    const pushCombinedTherapy = ({
+      title,
+      tone,
+      startRow,
+      endRow,
+      fallbackStartDate = null,
+      fallbackEndDate = null,
+      extraDetails = [],
+    }) => {
+      const startDate = startRow?.event_date || fallbackStartDate || null;
+      const endDate = endRow?.event_date || fallbackEndDate || null;
+      const startRel = startRow ? relativeDays(startRow) : diffDays(diagnosisDate, startDate);
+      const endRel = endRow ? relativeDays(endRow) : diffDays(diagnosisDate, endDate);
+      const agent = startRow?.treatment_agent || endRow?.treatment_agent || null;
+      if (startRow) markUsed(startRow);
+      if (endRow) markUsed(endRow);
+      items.push({
+        sortDate: parseIso(startDate)?.getTime() ?? null,
+        sortDay: startRel,
+        title,
+        subtitle: [
+          startDate ? GlioTwin.fmtDate(startDate) : null,
+          startRel != null ? `D+${startRel}` : null,
+          endDate ? `→ ${GlioTwin.fmtDate(endDate)}` : null,
+          agent || null,
+        ].filter(Boolean).join(' · ') || 'Evento temporale senza ancoraggio',
+        details: [
+          ['Start date', startDate ? GlioTwin.fmtDate(startDate) : '—'],
+          ['End date', endDate ? GlioTwin.fmtDate(endDate) : '—'],
+          ['Start day from diagnosis', fmtDay(startRel)],
+          ['End day from diagnosis', fmtDay(endRel)],
+          ['Treatment / agent', agent || '—'],
+          ...extraDetails,
+          ['Description', startRow?.description || endRow?.description || '—'],
+        ],
+        tone,
+      });
+    };
+    const rtStart = firstUnused('radiotherapy_start');
+    const rtEnd = firstUnused('radiotherapy_end');
+    if (rtStart || rtEnd || latestRt.start_date || latestRt.end_date || latestRt.fractions_count != null || latestRt.dose) {
+      pushCombinedTherapy({
+        title: 'Radiotherapy',
+        tone: 'radiotherapy',
+        startRow: rtStart,
+        endRow: rtEnd,
+        fallbackStartDate: latestRt.start_date,
+        fallbackEndDate: latestRt.end_date,
+        extraDetails: [
+          ['Prescription dose', latestRt.dose || latestRt.description || '—'],
+          ['Fractions', latestRt.fractions_count ?? '—'],
+          ['Course ID', latestRt.external_course_id || refs.ida || '—'],
+        ],
+      });
+    }
+    const chemoStart = firstUnused('chemotherapy_start');
+    const chemoEnd = firstUnused('chemotherapy_end');
+    if (chemoStart || chemoEnd) {
+      pushCombinedTherapy({
+        title: 'Chemotherapy',
+        tone: 'chemotherapy_start',
+        startRow: chemoStart,
+        endRow: chemoEnd,
+      });
+    }
+    rows.forEach((row, idx) => {
+      if (used.has(idx)) return;
+      const rel = relativeDays(row);
+      items.push({
+        sortDate: parseIso(row.event_date)?.getTime() ?? null,
+        sortDay: rel,
+        title: eventLabel(row.event_type),
+        subtitle: [
+          row.event_date ? GlioTwin.fmtDate(row.event_date) : null,
+          rel != null ? `D+${rel}` : null,
+          row.treatment_agent || null,
+        ].filter(Boolean).join(' · ') || 'Evento temporale senza ancoraggio',
+        details: [
+          ['Event type', eventLabel(row.event_type)],
+          ['Absolute date', row.event_date ? GlioTwin.fmtDate(row.event_date) : '—'],
+          ['Days from diagnosis', fmtDay(rel)],
+          ['Treatment / agent', row.treatment_agent || '—'],
+          ['RANO response', row.rano_response || '—'],
+          ['Session link', row.session_id || '—'],
+          ['Description', row.description || '—'],
+        ],
+        tone: row.event_type || 'other',
+      });
+    });
+    (_S.sessions || []).forEach((session) => {
+      const rel = session.days_from_baseline != null && session.days_from_baseline !== '' ? Number(session.days_from_baseline) : diffDays(diagnosisDate, session.study_date);
+      const tone = imagingLabel(session);
+      items.push({
+        sortDate: parseIso(session.study_date)?.getTime() ?? null,
+        sortDay: rel,
+        title: eventLabel(tone),
+        subtitle: [
+          session.session_label || null,
+          session.study_date ? GlioTwin.fmtDate(session.study_date) : null,
+          rel != null ? `D+${rel}` : null,
+        ].filter(Boolean).join(' · ') || 'Esame di imaging',
+        details: [
+          ['Imaging exam', session.session_label || '—'],
+          ['Modality', eventLabel(tone)],
+          ['Study date', session.study_date ? GlioTwin.fmtDate(session.study_date) : '—'],
+          ['Days from diagnosis', fmtDay(rel)],
+          ['Timepoint type', session.timepoint_type || '—'],
+          ['Sequences', session.n_sequences != null ? String(session.n_sequences) : '—'],
+        ],
+        tone,
+      });
+    });
+    items.sort((a, b) => {
+      const ad = Number.isFinite(a.sortDay) ? a.sortDay : (a.sortDate ?? Number.MAX_SAFE_INTEGER);
+      const bd = Number.isFinite(b.sortDay) ? b.sortDay : (b.sortDate ?? Number.MAX_SAFE_INTEGER);
+      return ad - bd;
+    });
+    return items;
+  };
+  const eventItems = buildEventRows();
+  const overview = [
+    ['Patient', GlioTwin.patientPrimary(patient)],
+    ['Dataset', GlioTwin.humanizeDataset(patient.dataset)],
+    ['Diagnosis', patient.diagnosis || '—'],
+    ['Diagnosis date', GlioTwin.fmtDate(patient.diagnosis_date)],
+    ['Age at diagnosis', patient.age_at_diagnosis != null ? `${Number(patient.age_at_diagnosis).toFixed(0)} yr` : '—'],
+    ['Sex', patient.sex || '—'],
+    ['Birth date', GlioTwin.fmtDate(patient.patient_birth_date)],
+    ['Outcome', patient.vital_status ? patient.vital_status.replaceAll('_', ' ') : '—'],
+    ['OS', patient.os_days != null ? `${patient.os_days} d` : '—'],
+    ['IDH', patient.idh_status || '—'],
+    ['MGMT', patient.mgmt_status || '—'],
+    ['IDA', refs.ida || latestRt.external_course_id || '—'],
+    ['Tax code', refs.tax_code || latestRt.tax_code || '—'],
+    ['Notes', patient.notes || '—'],
+  ];
+
   host.innerHTML = `
     <div class="signal-panel-head">
       <div>
-        <div class="signal-panel-title">Patient Data Editor</div>
-        <div class="signal-panel-sub">Modifica manuale dei campi anagrafici e clinici principali. I dati RT vengono armonizzati con le tabelle dedicate e con gli eventi clinici.</div>
+        <div class="signal-panel-title">Patient Data</div>
+        <div class="signal-panel-sub">Overview clinica e dati globali del soggetto. Gli eventi sotto sono navigabili ed espandibili con dettaglio assoluto e relativo quando disponibile.</div>
       </div>
     </div>
-    <form class="patient-edit-form" id="patient-edit-form">
-      <label><span>Patient Name</span><input class="patient-edit-input" name="patient_name" value="${GlioTwin.fmt(patient.patient_name, '')}"></label>
-      <label><span>Given Name</span><input class="patient-edit-input" name="patient_given_name" value="${GlioTwin.fmt(patient.patient_given_name, '')}"></label>
-      <label><span>Family Name</span><input class="patient-edit-input" name="patient_family_name" value="${GlioTwin.fmt(patient.patient_family_name, '')}"></label>
-      <label><span>Birth Date</span><input class="patient-edit-input" name="patient_birth_date" value="${GlioTwin.fmt(patient.patient_birth_date, '')}" placeholder="YYYYMMDD"></label>
-      <label><span>Sex</span><input class="patient-edit-input" name="sex" value="${GlioTwin.fmt(patient.sex, '')}"></label>
-      <label><span>Diagnosis</span><input class="patient-edit-input" name="diagnosis" value="${GlioTwin.fmt(patient.diagnosis, '')}"></label>
-      <label><span>Diagnosis Date</span><input type="date" class="patient-edit-input" name="diagnosis_date" value="${GlioTwin.fmt(patient.diagnosis_date, '')}"></label>
-      <label><span>Death Date</span><input type="date" class="patient-edit-input" name="death_date" value="${GlioTwin.fmt(patient.death_date, '')}"></label>
-      <label><span>IDH</span><input class="patient-edit-input" name="idh_status" value="${GlioTwin.fmt(patient.idh_status, '')}"></label>
-      <label><span>MGMT</span><input class="patient-edit-input" name="mgmt_status" value="${GlioTwin.fmt(patient.mgmt_status, '')}"></label>
-      <label><span>Age At Dx</span><input type="number" step="0.1" class="patient-edit-input" name="age_at_diagnosis" value="${patient.age_at_diagnosis ?? ''}"></label>
-      <label><span>OS Days</span><input type="number" class="patient-edit-input" name="os_days" value="${patient.os_days ?? ''}"></label>
-      <label><span>Vital Status</span><input class="patient-edit-input" name="vital_status" value="${GlioTwin.fmt(patient.vital_status, '')}"></label>
-      <label><span>IDA</span><input class="patient-edit-input" name="ida" value="${GlioTwin.fmt(refs.ida || latestRt.external_course_id, '')}"></label>
-      <label><span>Tax Code</span><input class="patient-edit-input" name="tax_code" value="${GlioTwin.fmt(refs.tax_code || latestRt.tax_code, '')}"></label>
-      <label><span>RT Start</span><input type="date" class="patient-edit-input" name="radiotherapy_start_date" value="${GlioTwin.fmt(patient.radiotherapy_start_date || latestRt.start_date, '')}"></label>
-      <label><span>Fractions</span><input type="number" class="patient-edit-input" name="fractions_count" value="${latestRt.fractions_count ?? ''}"></label>
-      <label class="patient-edit-notes"><span>Notes</span><textarea class="patient-edit-input" name="notes" rows="4">${GlioTwin.fmt(patient.notes, '')}</textarea></label>
-      <div class="patient-edit-actions">
-        <button type="submit" class="btn btn-primary">Save Patient Data</button>
-      </div>
-    </form>
+    <div class="patient-data-layout">
+      <section class="patient-overview-card">
+        <div class="patient-section-title">Overview & Global Data</div>
+        <div class="patient-overview-grid">
+          ${overview.map(([label, value]) => `
+            <div class="patient-overview-item">
+              <span class="patient-overview-label">${label}</span>
+              <strong class="patient-overview-value">${GlioTwin.fmt(value, '—')}</strong>
+            </div>
+          `).join('')}
+        </div>
+      </section>
+      <section class="patient-events-card">
+        <div class="patient-section-title">Clinical Events Timeline</div>
+        <div class="patient-events-list">
+          ${eventItems.length ? eventItems.map((item, idx) => `
+            <details class="patient-event ${item.tone || 'other'}" ${idx === 0 ? 'open' : ''}>
+              <summary class="patient-event-summary">
+                <span class="patient-event-main">
+                  <strong>${item.title}</strong>
+                  <small>${item.subtitle || 'Evento temporale senza ancoraggio'}</small>
+                </span>
+              </summary>
+              <div class="patient-event-body">
+                <div class="patient-event-grid">
+                  ${item.details.map(([label, value]) => `
+                    <div class="patient-event-row">
+                      <span class="patient-event-label">${label}</span>
+                      <strong class="patient-event-value">${GlioTwin.fmt(value, '—')}</strong>
+                    </div>
+                  `).join('')}
+                </div>
+              </div>
+            </details>
+          `).join('') : '<div class="signal-empty">No clinical events available.</div>'}
+        </div>
+      </section>
+    </div>
   `;
-  host.querySelector('#patient-edit-form')?.addEventListener('submit', _submitPatientEditor);
 }
 
 async function _submitPatientEditor(event) {
@@ -1194,21 +1401,17 @@ function _safeRenderMiniInfo(patient) {
 }
 
 function _renderRightTabUi() {
+  if (_S.activeRightTab === 'metrics') _S.activeRightTab = 'patient';
   const viewerArea = document.getElementById('viewer-area');
-  const signalPanel = document.getElementById('signal-panel');
   const patientEditorPanel = document.getElementById('patient-editor-panel');
   const tabViewer = document.getElementById('right-tab-viewer');
-  const tabMetrics = document.getElementById('right-tab-metrics');
   const tabPatient = document.getElementById('right-tab-patient');
-  if (!viewerArea || !signalPanel || !patientEditorPanel || !tabViewer || !tabMetrics || !tabPatient) return;
+  if (!viewerArea || !patientEditorPanel || !tabViewer || !tabPatient) return;
   const isViewer = _S.activeRightTab === 'viewer';
-  const isMetrics = _S.activeRightTab === 'metrics';
   const isPatient = _S.activeRightTab === 'patient';
   viewerArea.style.display = isViewer ? 'flex' : 'none';
-  signalPanel.style.display = isMetrics ? 'block' : 'none';
   patientEditorPanel.style.display = isPatient ? 'block' : 'none';
   tabViewer.classList.toggle('active', isViewer);
-  tabMetrics.classList.toggle('active', isMetrics);
   tabPatient.classList.toggle('active', isPatient);
 }
 
@@ -1242,7 +1445,7 @@ GlioTwin.register('browser', async (app) => {
             <div class="filter-row">
               <select class="f-sel" id="f-ds">
                 <option value="">All datasets</option>
-                <option value="irst_dicom_raw">IRST</option>
+                <option value="irst_dicom_raw">DICOM</option>
                 <option value="mu_glioma_post">MU-Glioma-Post</option>
                 <option value="ucsd_ptgbm">UCSD-PTGBM</option>
                 <option value="rhuh_gbm">RHUH-GBM</option>
@@ -1304,7 +1507,6 @@ GlioTwin.register('browser', async (app) => {
       <div class="right-tabs">
         <button class="right-tab ${_S.activeRightTab === 'patient' ? 'active' : ''}" id="right-tab-patient">Patient Data</button>
         <button class="right-tab ${_S.activeRightTab === 'viewer' ? 'active' : ''}" id="right-tab-viewer">Viewer</button>
-        <button class="right-tab ${_S.activeRightTab === 'metrics' ? 'active' : ''}" id="right-tab-metrics">Longitudinal Metrics</button>
       </div>
       <div class="viewer-area" id="viewer-area">
         <div class="viewer-empty" id="main-empty">
@@ -1318,7 +1520,6 @@ GlioTwin.register('browser', async (app) => {
         <div class="seq-grid" id="seq-grid" style="display:none"></div>
         <div class="nv-status" id="nv-status"></div>
       </div>
-      <div class="signal-panel" id="signal-panel" style="display:none"></div>
       <div class="signal-panel" id="patient-editor-panel" style="display:none"></div>
     </div>
 
@@ -1415,10 +1616,6 @@ GlioTwin.register('browser', async (app) => {
   });
   document.getElementById('right-tab-viewer')?.addEventListener('click', () => {
     _S.activeRightTab = 'viewer';
-    _renderRightTabUi();
-  });
-  document.getElementById('right-tab-metrics')?.addEventListener('click', () => {
-    _S.activeRightTab = 'metrics';
     _renderRightTabUi();
   });
   _renderRightTabUi();

@@ -177,3 +177,28 @@ CREATE TABLE IF NOT EXISTS processing_jobs (
     finished_at         TEXT,
     updated_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+
+CREATE TABLE IF NOT EXISTS session_checklist (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    phase           TEXT    NOT NULL CHECK(phase IN (
+                        'import','preprocessing','segmentation','analysis','export'
+                    )),
+    step_key        TEXT    NOT NULL,
+    step_name       TEXT    NOT NULL,
+    status          TEXT    NOT NULL DEFAULT 'pending' CHECK(status IN (
+                        'pending','running','done','failed','blocked','skipped'
+                    )),
+    blocking_reason TEXT,
+    output_ref      TEXT,
+    started_at      TEXT,
+    finished_at     TEXT,
+    updated_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE(session_id, step_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_checklist_session
+    ON session_checklist(session_id);
+
+CREATE INDEX IF NOT EXISTS idx_session_checklist_phase_status
+    ON session_checklist(phase, status);

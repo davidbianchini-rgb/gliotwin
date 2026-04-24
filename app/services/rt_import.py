@@ -12,6 +12,7 @@ import pandas as pd
 from fastapi import HTTPException
 
 from app.db import db, rows_as_dicts
+from app.services.clinical_timeline import sync_subject_timeline_offsets
 from app.services.subject_identity import (
     add_subject_alias,
     create_subject,
@@ -673,7 +674,8 @@ def commit_rt_excel(file_path: str, dataset: str = DEFAULT_RT_DATASET) -> dict[s
                     continue
                 subject_dict = dict(subject_row)
             else:
-                subject_dict = _resolve_or_create_subject_from_rt(conn, source_row, dataset, resolved)
+                skipped_unmatched += 1
+                continue
 
             _update_subject_from_rt(conn, subject_dict, source_row)
             _upsert_subject_ref(conn, subject_dict["id"], "ida", source_row.ida, source_row.ida)
@@ -709,6 +711,7 @@ def commit_rt_excel(file_path: str, dataset: str = DEFAULT_RT_DATASET) -> dict[s
                 rt_days,
                 rt_description,
             )
+            sync_subject_timeline_offsets(conn, subject_dict["id"])
 
             imported += 1
             imported_subjects.append(

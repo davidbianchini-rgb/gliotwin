@@ -116,6 +116,37 @@ def _ensure_sequences_check_constraint(conn: sqlite3.Connection) -> None:
     conn.execute(f"PRAGMA schema_version = {version + 1}")
 
 
+def _ensure_session_checklist(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS session_checklist (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id      INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            phase           TEXT    NOT NULL CHECK(phase IN (
+                                'import','preprocessing','segmentation','analysis','export'
+                            )),
+            step_key        TEXT    NOT NULL,
+            step_name       TEXT    NOT NULL,
+            status          TEXT    NOT NULL DEFAULT 'pending' CHECK(status IN (
+                                'pending','running','done','failed','blocked','skipped'
+                            )),
+            blocking_reason TEXT,
+            output_ref      TEXT,
+            started_at      TEXT,
+            finished_at     TEXT,
+            updated_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            UNIQUE(session_id, step_key)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_checklist_session ON session_checklist(session_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_checklist_phase_status ON session_checklist(phase, status)"
+    )
+
+
 def _run_migrations(conn: sqlite3.Connection) -> None:
     _ensure_subjects_table(conn)
     _repair_sessions_fk_reference(conn)
@@ -131,6 +162,7 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "sequences", "source_series_uid", "TEXT")
     _ensure_column(conn, "sequences", "metadata_json", "TEXT")
     _ensure_column(conn, "clinical_events", "event_date", "TEXT")
+    _ensure_session_checklist(conn)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS processing_jobs (

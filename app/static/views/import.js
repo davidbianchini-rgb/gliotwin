@@ -5,9 +5,9 @@
 const IMPORT_DATASETS = [
   {
     key: 'irst_dicom_raw',
-    label: 'IRST',
+    label: 'DICOM',
     kind: 'ui',
-    description: 'Dati DICOM interni IRST. Flusso UI completo: scan, review, commit, import RT.',
+    description: 'Dati DICOM interni. Flusso UI completo: scan, review, commit, import RT.',
   },
   {
     key: 'mu_glioma_post',
@@ -81,6 +81,12 @@ const ImportView = {
     selectedStructures: ['t1n', 't1c', 't2w', 't2f', 'apt'],
     lastCommit: null,
     lastRtCommit: null,
+    pipelineRootPath: '/mnt/dati/MU-Glioma-Post',
+    pipelineStatus: null,
+    pipelineLoading: false,
+    lumiereRootPath: '/mnt/dati/lumiere',
+    lumiereStatus: null,
+    lumiereLoading: false,
   },
 
   _currentDatasetInfo() {
@@ -388,6 +394,90 @@ const ImportView = {
     this.state.roots = data.roots || [];
     if (!this.state.selectedRoot && this.state.roots.length) {
       this.state.selectedRoot = this.state.roots[0];
+    }
+  },
+
+  async loadLumiereStatus() {
+    const rootPath = this.state.lumiereRootPath || '/mnt/dati/lumiere';
+    this.state.lumiereLoading = true;
+    this.render(document.getElementById('app'));
+    try {
+      const query = new URLSearchParams({ root_path: rootPath }).toString();
+      this.state.lumiereStatus = await GlioTwin.fetch(`/api/import/lumiere/status?${query}`);
+    } catch (error) {
+      console.error('[lumiere status]', error);
+      GlioTwin.toast(error.message, 'error');
+    } finally {
+      this.state.lumiereLoading = false;
+      this.render(document.getElementById('app'));
+    }
+  },
+
+  async runLumiereImport() {
+    const rootPath = document.getElementById('lumiere-root-path')?.value?.trim() || '/mnt/dati/lumiere';
+    this.state.lumiereRootPath = rootPath;
+    this.state.lumiereLoading = true;
+    this.render(document.getElementById('app'));
+    try {
+      const result = await GlioTwin.post('/api/import/lumiere/run', {
+        root_path: rootPath,
+        purge_selected: false,
+        subjects: [],
+      });
+      if (result.status === 'already_running') {
+        GlioTwin.toast('Import LUMIERE già in esecuzione', 'info');
+      } else {
+        GlioTwin.toast('Import LUMIERE avviato', 'info');
+      }
+      await this.loadLumiereStatus();
+    } catch (error) {
+      console.error('[lumiere run]', error);
+      GlioTwin.toast(error.message, 'error');
+      this.state.lumiereLoading = false;
+      this.render(document.getElementById('app'));
+    }
+  },
+
+  async loadPipelineStatus() {
+    const info = this._currentDatasetInfo();
+    if (info.key !== 'mu_glioma_post') return;
+    const rootPath = this.state.pipelineRootPath || '/mnt/dati/MU-Glioma-Post';
+    this.state.pipelineLoading = true;
+    this.render(document.getElementById('app'));
+    try {
+      const query = new URLSearchParams({ root_path: rootPath }).toString();
+      this.state.pipelineStatus = await GlioTwin.fetch(`/api/import/mu/status?${query}`);
+    } catch (error) {
+      console.error('[mu status]', error);
+      GlioTwin.toast(error.message, 'error');
+    } finally {
+      this.state.pipelineLoading = false;
+      this.render(document.getElementById('app'));
+    }
+  },
+
+  async runMuImport() {
+    const rootPath = document.getElementById('mu-root-path')?.value?.trim() || '/mnt/dati/MU-Glioma-Post';
+    this.state.pipelineRootPath = rootPath;
+    this.state.pipelineLoading = true;
+    this.render(document.getElementById('app'));
+    try {
+      const result = await GlioTwin.post('/api/import/mu/run', {
+        root_path: rootPath,
+        purge_selected: false,
+        subjects: [],
+      });
+      if (result.status === 'already_running') {
+        GlioTwin.toast('Import MU gia in esecuzione', 'info');
+      } else {
+        GlioTwin.toast('Import MU avviato', 'info');
+      }
+      await this.loadPipelineStatus();
+    } catch (error) {
+      console.error('[mu run]', error);
+      GlioTwin.toast(error.message, 'error');
+      this.state.pipelineLoading = false;
+      this.render(document.getElementById('app'));
     }
   },
 
@@ -860,7 +950,18 @@ const ImportView = {
     });
 
     app.querySelector('#import-run-discover')?.addEventListener('click', () => this.runDiscover());
+    app.querySelector('#import-run-rt-commit')?.addEventListener('click', () => this.runRtCommit());
     app.querySelector('#import-run-commit')?.addEventListener('click', () => this.runCommit());
+    app.querySelector('#mu-check-dataset')?.addEventListener('click', () => this.loadPipelineStatus());
+    app.querySelector('#mu-run-import')?.addEventListener('click', () => this.runMuImport());
+    app.querySelector('#mu-root-path')?.addEventListener('change', (event) => {
+      this.state.pipelineRootPath = event.target.value.trim();
+    });
+    app.querySelector('#lumiere-check-dataset')?.addEventListener('click', () => this.loadLumiereStatus());
+    app.querySelector('#lumiere-run-import')?.addEventListener('click', () => this.runLumiereImport());
+    app.querySelector('#lumiere-root-path')?.addEventListener('change', (event) => {
+      this.state.lumiereRootPath = event.target.value.trim();
+    });
     app.querySelectorAll('.structure-include').forEach(input => {
       input.addEventListener('change', (event) => {
         const key = event.target.dataset.structureKey;
@@ -997,17 +1098,25 @@ const ImportView = {
           <button id="import-run-discover" class="btn" ${(this.state.loading || this.state.rtLoading) ? 'disabled' : ''}>
             ${(this.state.loading || this.state.rtLoading) ? 'Reading…' : 'Scan Sources'}
           </button>
+          <button id="import-run-rt-commit" class="btn ${hasSelectedExams ? 'btn-secondary' : 'btn-primary import-primary-btn'}" ${(this.state.rtLoading || !this.state.rtFilePath) ? 'disabled' : ''}>
+            ${(this.state.rtLoading) ? 'Working…' : 'Import Clinical RT'}
+          </button>
           ${hasSelectedExams ? `
             <button id="import-run-commit" class="btn btn-primary import-primary-btn" ${(!scan || this.state.loading || this.state.rtLoading) ? 'disabled' : ''}>
               ${(this.state.loading || this.state.rtLoading) ? 'Working…' : 'Import Selected'}
             </button>
           ` : ''}
-          <div class="import-action-hint">Legge le due sorgenti, cerca corrispondenze paziente e poi importa solo gli studi DICOM selezionati.</div>
+          <div class="import-action-hint"><code>Scan Sources</code> legge DICOM e/o file RT. <code>Import Clinical RT</code> carica solo i dati clinici RT sul dataset gia importato, senza reimportare le immagini. <code>Import Selected</code> importa solo gli studi DICOM selezionati.</div>
         </div>
 
         <div class="import-helper-text">
           Gli esami in <code>review</code> sono completi: le 4 core sono state trovate, ma almeno una classe ha piu candidati. Il sistema non li accorpa: sceglie il migliore per default e tu puoi cambiarlo nel pannello di destra.
         </div>
+        ${!hasSelectedExams && this.state.rtFilePath ? `
+          <div class="import-helper-text">
+            Non serve selezionare nessuna serie per caricare il file clinico. Puoi usare direttamente <code>Import Clinical RT</code>.
+          </div>
+        ` : ''}
       </div>
 
       ${this.state.lastCommit ? `
@@ -1064,6 +1173,112 @@ const ImportView = {
   },
 
   renderPipelineSection(info) {
+    if (info.key === 'lumiere') {
+      const status = this.state.lumiereStatus;
+      const dataset = status?.dataset;
+      const counts = status?.db_counts;
+      const job = status?.job;
+      const available = dataset?.available || {};
+      const discovered = dataset?.counts || {};
+      return `
+        <div class="import-pipeline-card card">
+          <div class="card-title">Import LUMIERE</div>
+          <div class="import-pipeline-desc">
+            Dataset longitudinale LUMIERE: MRI multi-contrasto, segmentazioni HD-GLIO-AUTO (solo T1ce) e dati clinici
+            (demografia, IDH, MGMT, OS, RANO). Ogni paziente ha più timepoint settimanali.
+          </div>
+          <div class="import-form-grid">
+            <div class="import-form-field import-form-field-wide">
+              <label for="lumiere-root-path">Root dataset</label>
+              <input id="lumiere-root-path" class="import-input" value="${this.state.lumiereRootPath || '/mnt/dati/lumiere'}" placeholder="/mnt/dati/lumiere">
+            </div>
+          </div>
+          <div class="import-actions-row">
+            <button id="lumiere-check-dataset" class="btn" ${this.state.lumiereLoading ? 'disabled' : ''}>Check Dataset</button>
+            <button id="lumiere-run-import" class="btn btn-primary import-primary-btn" ${(this.state.lumiereLoading || job?.running) ? 'disabled' : ''}>Import LUMIERE</button>
+          </div>
+          ${job ? `
+            <div class="import-helper-text">
+              Stato: <strong>${job.running ? 'running' : 'idle'}</strong> · ${GlioTwin.fmt(job.last_msg || '—')}
+              ${job.error ? `<div class="import-warning-text">${GlioTwin.fmt(job.error)}</div>` : ''}
+            </div>
+          ` : ''}
+          ${dataset ? `
+            <div class="import-summary-grid">
+              <div class="import-summary-card"><div class="import-summary-label">Imaging</div><div class="import-summary-value">${available.imaging ? 'OK' : 'NO'}</div><div class="import-summary-hint">${discovered.patients || 0} pazienti</div></div>
+              <div class="import-summary-card"><div class="import-summary-label">Sessions</div><div class="import-summary-value">${discovered.sessions || 0}</div><div class="import-summary-hint">timepoint trovati</div></div>
+              <div class="import-summary-card"><div class="import-summary-label">Demographics</div><div class="import-summary-value">${available.demographics ? 'OK' : 'NO'}</div><div class="import-summary-hint">CSV clinico</div></div>
+              <div class="import-summary-card"><div class="import-summary-label">T1ce segs</div><div class="import-summary-value">${discovered.seg_files || 0}</div><div class="import-summary-hint">segmentazioni</div></div>
+            </div>
+            <div class="import-helper-text">
+              Imaging root: <code>${dataset.imaging}</code>
+            </div>
+          ` : ''}
+          ${counts ? `
+            <div class="import-summary-grid">
+              <div class="import-summary-card"><div class="import-summary-label">Subjects</div><div class="import-summary-value">${counts.subjects}</div><div class="import-summary-hint">nel DB</div></div>
+              <div class="import-summary-card"><div class="import-summary-label">Sessions</div><div class="import-summary-value">${counts.sessions}</div><div class="import-summary-hint">timepoint importati</div></div>
+              <div class="import-summary-card"><div class="import-summary-label">Sequences</div><div class="import-summary-value">${counts.sequences}</div><div class="import-summary-hint">MRI</div></div>
+              <div class="import-summary-card"><div class="import-summary-label">Structures</div><div class="import-summary-value">${counts.structures}</div><div class="import-summary-hint">HD-GLIO-AUTO</div></div>
+            </div>
+          ` : ''}
+        </div>
+      `;
+    }
+    if (info.key === 'mu_glioma_post') {
+      const status = this.state.pipelineStatus;
+      const dataset = status?.dataset;
+      const counts = status?.db_counts;
+      const job = status?.job;
+      const available = dataset?.available || {};
+      const discovered = dataset?.counts || {};
+      return `
+        <div class="import-pipeline-card card">
+          <div class="card-title">Import MU-Glioma-Post</div>
+          <div class="import-pipeline-desc">
+            MRI, strutture radiologiche e dati clinici vengono importati assieme e associati ai timepoint del dataset.
+            Dopo l'import i casi devono essere visibili direttamente nel Viewer; eventuali nuove segmentazioni restano separate dalle strutture importate.
+          </div>
+          <div class="import-form-grid">
+            <div class="import-form-field import-form-field-wide">
+              <label for="mu-root-path">Root dataset</label>
+              <input id="mu-root-path" class="import-input" value="${this.state.pipelineRootPath || '/mnt/dati/MU-Glioma-Post'}" placeholder="/mnt/dati/MU-Glioma-Post">
+            </div>
+          </div>
+          <div class="import-actions-row">
+            <button id="mu-check-dataset" class="btn" ${this.state.pipelineLoading ? 'disabled' : ''}>Check Dataset</button>
+            <button id="mu-run-import" class="btn btn-primary import-primary-btn" ${(this.state.pipelineLoading || job?.running) ? 'disabled' : ''}>Import MU</button>
+          </div>
+          ${job ? `
+            <div class="import-helper-text">
+              Stato: <strong>${job.running ? 'running' : 'idle'}</strong> · ${GlioTwin.fmt(job.last_msg || '—')}
+              ${job.error ? `<div class="import-warning-text">${GlioTwin.fmt(job.error)}</div>` : ''}
+            </div>
+          ` : ''}
+          ${dataset ? `
+            <div class="import-summary-grid">
+              <div class="import-summary-card"><div class="import-summary-label">MRI</div><div class="import-summary-value">${available.mri ? 'OK' : 'NO'}</div><div class="import-summary-hint">${discovered.patients || 0} pazienti</div></div>
+              <div class="import-summary-card"><div class="import-summary-label">Structures</div><div class="import-summary-value">${available.structures ? 'OK' : 'NO'}</div><div class="import-summary-hint">${discovered.mask_files || 0} mask</div></div>
+              <div class="import-summary-card"><div class="import-summary-label">Clinical</div><div class="import-summary-value">${available.clinical ? 'OK' : 'NO'}</div><div class="import-summary-hint">excel presente</div></div>
+              <div class="import-summary-card"><div class="import-summary-label">Timepoints</div><div class="import-summary-value">${discovered.timepoints || 0}</div><div class="import-summary-hint">cartelle trovate</div></div>
+            </div>
+            <div class="import-helper-text">
+              Data root: <code>${dataset.data_root}</code><br>
+              Clinical file: <code>${dataset.clinical_xls}</code><br>
+              Volumes file: <code>${dataset.volumes_xls}</code>
+            </div>
+          ` : ''}
+          ${counts ? `
+            <div class="import-summary-grid">
+              <div class="import-summary-card"><div class="import-summary-label">Subjects</div><div class="import-summary-value">${counts.subjects}</div><div class="import-summary-hint">nel DB</div></div>
+              <div class="import-summary-card"><div class="import-summary-label">Sessions</div><div class="import-summary-value">${counts.sessions}</div><div class="import-summary-hint">timepoint importati</div></div>
+              <div class="import-summary-card"><div class="import-summary-label">Sequences</div><div class="import-summary-value">${counts.sequences}</div><div class="import-summary-hint">MRI</div></div>
+              <div class="import-summary-card"><div class="import-summary-label">Structures</div><div class="import-summary-value">${counts.structures}</div><div class="import-summary-hint">radiologiche</div></div>
+            </div>
+          ` : ''}
+        </div>
+      `;
+    }
     return `
       <div class="import-pipeline-card card">
         <div class="card-title">Pipeline server-side — ${info.label}</div>
@@ -1119,8 +1334,8 @@ const ImportView = {
               ? this.renderExamDetail(this.selectedExam())
               : `<div class="import-empty-panel">${
                   dsInfo.kind === 'ui'
-                    ? 'Dopo il primo scan, qui appariranno serie candidate, conflitti, sequenze core mancanti e selezione keep/discard.'
-                    : 'Il pannello di dettaglio è disponibile solo per il flusso IRST DICOM.'
+                ? 'Dopo il primo scan, qui appariranno serie candidate, conflitti, sequenze core mancanti e selezione keep/discard.'
+                    : 'Il pannello di dettaglio è disponibile solo per il flusso DICOM.'
                 }</div>`
             }
           </aside>
@@ -1138,6 +1353,22 @@ GlioTwin.register('import', async (app) => {
     } catch (error) {
       console.error('[import roots]', error);
       GlioTwin.toast(error.message, 'error');
+    }
+  }
+  if (ImportView.state.selectedDataset === 'mu_glioma_post') {
+    try {
+      await ImportView.loadPipelineStatus();
+      return;
+    } catch (error) {
+      console.error('[mu preload]', error);
+    }
+  }
+  if (ImportView.state.selectedDataset === 'lumiere') {
+    try {
+      await ImportView.loadLumiereStatus();
+      return;
+    } catch (error) {
+      console.error('[lumiere preload]', error);
     }
   }
   ImportView.render(app);

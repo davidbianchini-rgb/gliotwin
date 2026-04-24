@@ -26,6 +26,14 @@ SEQ_FILES = {
     'FLAIR.nii.gz': ('FLAIR', 0),
 }
 
+# Prefisso del file registrato HD-GLIO-AUTO per sequence_type
+REG_PREFIX = {
+    'T1':    'T1',
+    'T1ce':  'CT1',
+    'T2':    'T2',
+    'FLAIR': 'FLAIR',
+}
+
 # HD-GLIO-AUTO: label_code → label_name (usato come prefisso nel nome struttura)
 HD_LABELS = {
     1: 'tumor_core',
@@ -54,8 +62,14 @@ RATING_TO_TP = {
     '':           'other',
 }
 
-# RANO valori validi per clinical_events
-RANO_VALID = {'CR', 'PR', 'SD', 'PD'}
+# RANO rating → testo esteso per clinical_events
+RANO_MAP = {
+    'CR': 'Complete Response',
+    'PR': 'Partial Response',
+    'SD': 'Stable Disease',
+    'PD': 'Progressive Disease',
+}
+RANO_VALID = set(RANO_MAP)
 
 
 def _is_native_lumiere_seg(seg_path: Path) -> bool:
@@ -156,20 +170,29 @@ def _import_session(conn: sqlite3.Connection, subject_pk: int,
         )
         seq_pks[seq_type] = pk
 
-    # ── HD-GLIO-AUTO segmentazioni native (una per sequenza) ───────
+    # ── Processed path: versioni registrate e brain-extracted ─────
+    hd_reg = week_dir / 'HD-GLIO-AUTO-segmentation' / 'registered'
+    if hd_reg.exists():
+        for seq_type, seq_pk in seq_pks.items():
+            prefix = REG_PREFIX.get(seq_type)
+            if not prefix:
+                continue
+            reg_path = hd_reg / f'{prefix}_r2s_bet_reg.nii.gz'
+            if reg_path.exists() and not is_partial(reg_path):
+                conn.execute(
+                    "UPDATE sequences SET processed_path = ? WHERE id = ? AND processed_path IS NULL",
+                    (str(reg_path), seq_pk),
+                )
+
+    # ── HD-GLIO-AUTO segmentazione nativa T1ce ────────────────────
     hd_native = week_dir / 'HD-GLIO-AUTO-segmentation' / 'native'
     if not hd_native.exists():
         return
 
-    for seg_fname, seq_type in SEG_NATIVE.items():
-        seg_path = hd_native / seg_fname
-        if not seg_path.exists() or is_partial(seg_path) or not _is_native_lumiere_seg(seg_path):
-            continue
-        seq_pk = seq_pks.get(seq_type)
-
-        for label_code, label_base in HD_LABELS.items():
-            # Nome leggibile: "tumor_core · T1"
-            label_name = f'{label_base} · {seq_type}'
+    seg_path = hd_native / 'segmentation_CT1_origspace.nii.gz'
+    if seg_path.exists() and not is_partial(seg_path) and _is_native_lumiere_seg(seg_path):
+        seq_pk = seq_pks.get('T1ce')
+        for label_code, label_name in HD_LABELS.items():
             insert_computed_structure(
                 conn, session_pk, seq_pk,
                 label=label_name,
@@ -187,6 +210,14 @@ def _import_session(conn: sqlite3.Connection, subject_pk: int,
             days=days,
             rano_response=rano,
         )
+
+    # ── Chirurgia (Post-Op) ────────────────────────────────────────
+    if rating in ('Post-Op', 'Post-Op ', 'Post-Op/PD'):
+        insert_clinical_event(conn, subject_pk, session_pk, 'surgery', days=days)
+
+    # ── Progressione (PD) ─────────────────────────────────────────
+    if rating in ('PD', 'Post-Op/PD'):
+        insert_clinical_event(conn, subject_pk, session_pk, 'progression', days=days)
 
 
 def run(
@@ -216,6 +247,7 @@ def run(
         os_weeks = safe_float(row.get('Survival time (weeks)', ''))
         os_days  = int(os_weeks * 7) if os_weeks else None
 
+        is_deceased = os_days is not None
         subject_pk = get_or_create_subject(
             conn, pid, 'lumiere',
             sex=norm_sex(row.get('Sex', '')),
@@ -224,9 +256,12 @@ def run(
             idh_status=_norm_idh(row.get('IDH (WT: wild type)', '')),
             mgmt_status=_norm_mgmt(row.get('MGMT qualitative', '')),
             os_days=os_days,
+            vital_status='deceased' if is_deceased else None,
         )
 
         insert_clinical_event(conn, subject_pk, None, 'diagnosis', 0)
+        if is_deceased:
+            insert_clinical_event(conn, subject_pk, None, 'death', days=os_days)
 
         pat_ratings = ratings.get(pid, {})
 

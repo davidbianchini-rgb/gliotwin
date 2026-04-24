@@ -106,7 +106,7 @@ const GlioTwin = {
   // ── Format helpers ────────────────────────────────────────
   humanizeDataset(ds) {
     const labels = {
-      irst_dicom_raw:  'IRST',
+      irst_dicom_raw:  'DICOM',
       lumiere:         'LUMIERE',
       mu_glioma_post:  'MU-Glioma-Post',
       ucsd_ptgbm:      'UCSD-PTGBM',
@@ -252,11 +252,6 @@ const GlioTwin = {
 
 // ── Bootstrap ──────────────────────────────────────────────────
 
-// alias: #/analysis → global-metrics (phase rename, keep old hash for back-compat)
-GlioTwin.register('analysis', async (app, arg) => {
-  const handler = GlioTwin.routes['global-metrics'];
-  if (handler) return handler(app, arg);
-});
 
 window.addEventListener('hashchange', () => GlioTwin.navigate(location.hash));
 

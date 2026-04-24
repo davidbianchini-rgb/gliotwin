@@ -26,6 +26,7 @@ SQLITE_TIMEOUT_SECONDS = 30.0
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 SQLITE_RETRY_ATTEMPTS = 5
 SQLITE_RETRY_DELAY_SECONDS = 1.0
+MIN_FREE_BYTES = 5 * 1024 * 1024 * 1024
 
 CORE_IMPORT_CLASS = {
     "T1": "t1n",
@@ -109,6 +110,15 @@ def session_payload(conn: sqlite3.Connection, job_id: int) -> dict:
     }
 
 
+def ensure_free_space(path: Path, minimum_bytes: int = MIN_FREE_BYTES) -> None:
+    usage = shutil.disk_usage(path)
+    if usage.free < minimum_bytes:
+        raise RuntimeError(
+            f"Insufficient free disk space on {path}: {usage.free / (1024**3):.2f} GB available, "
+            f"{minimum_bytes / (1024**3):.0f} GB required"
+        )
+
+
 def prepare_input(case: dict, job_root: Path) -> Path:
     case_root = job_root / "input" / case["subject_id"] / case["session_label"]
     case_root.mkdir(parents=True, exist_ok=True)
@@ -147,12 +157,15 @@ def main() -> int:
 
     job_id = args.job_id
     job_root = INPUT_ROOT / f"job_{job_id:05d}"
+    if job_root.exists():
+        shutil.rmtree(job_root)
     job_root.mkdir(parents=True, exist_ok=True)
     worker_log = job_root / "worker.log"
     worker_log.write_text("", encoding="utf-8")
 
     try:
         case = session_payload(conn, job_id)
+        ensure_free_space(INPUT_ROOT)
         ensure_state(
             case["subject_id"],
             case["session_label"],
@@ -267,7 +280,7 @@ def main() -> int:
             update_step(
                 case_ref["subject_id"],
                 case_ref["session_label"],
-                "tumor_segmentation",
+                "brain_extraction",
                 status="failed",
                 output_path=str(job_root),
                 error_message=str(exc),

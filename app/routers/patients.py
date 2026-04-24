@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app.db import db, rows_as_dicts
-from app.services.pipeline_state import state_path
+from app.services.clinical_timeline import sync_subject_timeline_offsets
 
 router = APIRouter(tags=["patients"])
 
@@ -93,11 +93,13 @@ def _subject_merge_guard(conn, patient_id: int) -> list[str]:
         if computed:
             issues.append("computed structures already exist")
 
-    subject_code = str(subject["subject_id"])
-    for sess in sessions:
-        if state_path(subject_code, str(sess["session_label"])).exists():
-            issues.append(f"pipeline state exists for {sess['session_label']}")
-            break
+    if session_ids:
+        checklist_count = conn.execute(
+            f"SELECT COUNT(*) FROM session_checklist WHERE session_id IN ({','.join('?' for _ in session_ids)})",
+            session_ids,
+        ).fetchone()[0]
+        if checklist_count:
+            issues.append("pipeline checklist state exists for one or more sessions")
     return issues
 
 
@@ -453,7 +455,10 @@ def _patient_detail(conn, patient_id: int) -> dict[str, Any]:
         "external_ref_map": ref_map,
         "radiotherapy_courses": rt_courses,
         "latest_radiotherapy_course": latest_rt,
-        "diagnosis_date": next((item.get("event_date") for item in events if item.get("event_type") == "diagnosis" and item.get("event_date")), None),
+        "diagnosis_date": (
+            next((item.get("event_date") for item in events if item.get("event_type") == "diagnosis" and item.get("event_date")), None)
+            or (latest_rt.get("diagnosis_date") if latest_rt else None)
+        ),
         "radiotherapy_start_date": next((item.get("event_date") for item in events if item.get("event_type") == "radiotherapy_start" and item.get("event_date")), None),
         "death_date": next((item.get("event_date") for item in events if item.get("event_type") == "death" and item.get("event_date")), None),
     }
@@ -544,6 +549,7 @@ def update_patient(patient_id: int, payload: PatientUpdateRequest):
         _upsert_clinical_event(conn, patient_id, "diagnosis", diagnosis_date, "Manual update from patient editor")
         _upsert_clinical_event(conn, patient_id, "radiotherapy_start", rt_start, "Manual update from patient editor")
         _upsert_clinical_event(conn, patient_id, "death", death_date, "Manual update from patient editor")
+        sync_subject_timeline_offsets(conn, patient_id)
 
         return _patient_detail(conn, patient_id)
 

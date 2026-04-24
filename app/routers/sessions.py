@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from app.db import db, rows_as_dicts
+from app.services.pipeline_state import sessions_ready_for_phase
 from app.services.structure_metrics import (
     get_signal_metric_job,
     latest_signal_metric_job,
@@ -148,6 +149,19 @@ def get_global_metrics():
             ORDER BY sub.subject_id, se.days_from_baseline
         """).fetchall()
     return {"rows": rows_as_dicts(rows)}
+
+
+@router.get("/sessions/ready-for/{phase}")
+def sessions_ready_for(phase: str):
+    """
+    Returns sessions ready to advance to the given phase.
+    Previous phase must have at least one done step; current phase must be fully pending.
+    Valid phases: import, preprocessing, segmentation, analysis, export.
+    """
+    try:
+        return {"phase": phase, "sessions": sessions_ready_for_phase(phase)}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
 
 
 @router.get("/sessions/{session_id}")

@@ -1,12 +1,10 @@
-/* rhglioseg.js — Segmentation: patient/timepoint list, model selector, run/delete */
 'use strict';
 
 const SEG_MODELS = [
   {
     key: 'fets_postop',
-    label: 'FeTS postop',
-    description: 'Tumor segmentation FeTS su casi gia preprocessati',
-    requires_preprocessing: true,
+    label: 'FeTS Post-op',
+    description: 'Tumor segmentation FeTS su casi già preprocessati',
     run_endpoint: '/api/fetsseg/run',
     status_endpoint: '/api/fetsseg/status',
   },
@@ -14,7 +12,6 @@ const SEG_MODELS = [
     key: 'rh-glioseg-v3',
     label: 'rh-GlioSeg v3',
     description: 'nnUNet 5-fold ensemble · Dataset016_RH-GlioSeg_v3',
-    requires_preprocessing: true,
     run_endpoint: '/api/rhglioseg/run',
     status_endpoint: '/api/rhglioseg/status',
   },
@@ -22,20 +19,34 @@ const SEG_MODELS = [
 
 const SegView = {
   state: {
-    sessions: [],
-    selected: {},        // session_id → bool
-    selectedModel: 'fets_postop',
-    filterPreproc: false,
-    filterQ: '',
-    jobStatus: {},
-    pollTimer: null,
-    loading: true,
+    sessions:        [],
+    selectedByModel: {},   // { modelKey: { sessionId: bool } }
+    filterPreproc:   false,
+    filterQ:         '',
+    jobStatus:       {},
+    pollTimer:       null,
+    loading:         true,
   },
 
-  selectedIds() {
-    return Object.entries(this.state.selected)
-      .filter(([, v]) => v)
-      .map(([k]) => parseInt(k, 10));
+  _initSelected() {
+    for (const m of SEG_MODELS) {
+      if (!this.state.selectedByModel[m.key]) this.state.selectedByModel[m.key] = {};
+    }
+  },
+
+  selectedForModel(modelKey) {
+    return Object.entries(this.state.selectedByModel[modelKey] || {})
+      .filter(([, v]) => v).map(([k]) => parseInt(k, 10));
+  },
+
+  totalSelected() {
+    const ids = new Set();
+    for (const m of SEG_MODELS) this.selectedForModel(m.key).forEach(id => ids.add(id));
+    return ids.size;
+  },
+
+  canSelect(session, modelKey) {
+    return session.preprocessing_ready && !(session.segmented_models || []).includes(modelKey);
   },
 
   filtered() {
@@ -43,40 +54,38 @@ const SegView = {
     return this.state.sessions.filter(s => {
       if (this.state.filterPreproc && !s.preprocessing_ready) return false;
       if (!q) return true;
-      return [s.subject_id, s.session_label, s.dataset]
+      return [s.subject_id, s.patient_name, s.patient_given_name, s.patient_family_name, s.session_label, s.dataset]
         .filter(Boolean).join(' ').toLowerCase().includes(q);
     });
   },
 
-  modelInfo() {
-    return SEG_MODELS.find(m => m.key === this.state.selectedModel) || SEG_MODELS[0];
-  },
-
   async load() {
+    this._initSelected();
     this.state.loading = true;
     this.render();
     const [sessions, ...statuses] = await Promise.all([
       GlioTwin.fetch('/api/segmentation/sessions'),
-      ...SEG_MODELS.map(model => GlioTwin.fetch(model.status_endpoint).catch(() => null)),
+      ...SEG_MODELS.map(m => GlioTwin.fetch(m.status_endpoint).catch(() => null)),
     ]);
     this.state.sessions  = sessions.sessions || [];
-    this.state.jobStatus = Object.fromEntries(SEG_MODELS.map((model, index) => [model.key, statuses[index]]));
+    this.state.jobStatus = Object.fromEntries(SEG_MODELS.map((m, i) => [m.key, statuses[i]]));
     this.state.loading   = false;
     this.render();
-    if (statuses.some(status => status?.running)) this._startPoll();
+    if (statuses.some(s => s?.running)) this._startPoll();
   },
 
   async refreshStatus() {
     const statuses = await Promise.all(
-      SEG_MODELS.map(model => GlioTwin.fetch(model.status_endpoint).catch(() => null))
+      SEG_MODELS.map(m => GlioTwin.fetch(m.status_endpoint).catch(() => null))
     );
-    this.state.jobStatus = Object.fromEntries(SEG_MODELS.map((model, index) => [model.key, statuses[index]]));
+    this.state.jobStatus = Object.fromEntries(SEG_MODELS.map((m, i) => [m.key, statuses[i]]));
     return this.state.jobStatus;
   },
 
   _startPoll() {
     clearTimeout(this.state.pollTimer);
     this.state.pollTimer = setTimeout(async () => {
+      if (!location.hash.startsWith('#/rhglioseg')) return;
       const statuses = await this.refreshStatus();
       if (Object.values(statuses || {}).some(s => s?.running)) {
         this._startPoll();
@@ -89,19 +98,26 @@ const SegView = {
   },
 
   async runSelected() {
-    const ids = this.selectedIds();
-    const model = this.modelInfo();
-    const modelStatus = this.state.jobStatus?.[model.key];
-    if (!ids.length) { GlioTwin.toast('Seleziona almeno una sessione', 'error'); return; }
-    if (modelStatus?.running) { GlioTwin.toast('Segmentazione già in corso per questo modello', 'error'); return; }
+    const tasks = SEG_MODELS
+      .map(m => ({ model: m, ids: this.selectedForModel(m.key) }))
+      .filter(t => t.ids.length > 0);
+
+    if (!tasks.length) { GlioTwin.toast('Seleziona almeno una sessione per almeno un modello', 'error'); return; }
+
+    const busy = tasks.filter(t => this.state.jobStatus?.[t.model.key]?.running);
+    if (busy.length) {
+      GlioTwin.toast(`Già in corso: ${busy.map(t => t.model.label).join(', ')}`, 'error');
+      return;
+    }
     try {
-      await GlioTwin.post(model.run_endpoint, { session_ids: ids, force: false });
-      GlioTwin.toast(`Avviata segmentazione su ${ids.length} sessione/i`, 'info');
-      this.state.selected = {};
-      this.state.jobStatus = {
-        ...this.state.jobStatus,
-        [model.key]: { running: true, current: 0, total: ids.length, last_msg: 'Avvio…' },
-      };
+      await Promise.all(tasks.map(t => GlioTwin.post(t.model.run_endpoint, { session_ids: t.ids, force: false })));
+      const n = new Set(tasks.flatMap(t => t.ids)).size;
+      GlioTwin.toast(`Avviate ${tasks.length} segmentazioni su ${n} sessione/i`, 'info');
+      this.state.selectedByModel = {};
+      this._initSelected();
+      for (const t of tasks) {
+        this.state.jobStatus[t.model.key] = { running: true, current: 0, total: t.ids.length, last_msg: 'Avvio…' };
+      }
       this.render();
       this._startPoll();
     } catch (e) { GlioTwin.toast(e.message, 'error'); }
@@ -123,33 +139,56 @@ const SegView = {
     } catch (e) { GlioTwin.toast(e.message, 'error'); }
   },
 
-  _modelChips(session) {
-    const model = this.state.selectedModel;
-    const done = session.segmented_models || [];
-    if (done.includes(model)) {
+  _modelCell(session, model) {
+    const done = (session.segmented_models || []).includes(model.key);
+    if (done) {
       return `
-        <span class="seg-chip seg-chip--done" title="${model}">✓ ${model}</span>
-        <button class="seg-delete-btn" data-sid="${session.session_id}" data-model="${model}" title="Cancella e ripeti">✕</button>
-      `;
+        <div class="seg-model-done">
+          <span class="seg-chip seg-chip--done" title="${model.key}">✓</span>
+          <button class="seg-delete-btn" data-sid="${session.session_id}" data-model="${model.key}" title="Cancella e ripeti">✕</button>
+        </div>`;
     }
     if (!session.preprocessing_ready) {
-      return `<span class="seg-chip seg-chip--wait" title="Preprocessing non completato">Preprocessing assente</span>`;
+      return `<span class="seg-chip seg-chip--wait" title="Preprocessing non completato">—</span>`;
     }
-    return `<span class="seg-chip seg-chip--pending">Non segmentato</span>`;
+    const checked = !!this.state.selectedByModel[model.key]?.[session.session_id];
+    return `
+      <label class="seg-cb-label">
+        <input type="checkbox" class="seg-model-cb"
+               data-sid="${session.session_id}" data-model="${model.key}"
+               ${checked ? 'checked' : ''}>
+        <span class="seg-cb-mark"></span>
+      </label>`;
+  },
+
+  _allChecked(modelKey, rows) {
+    const eligible = rows.filter(s => this.canSelect(s, modelKey));
+    return eligible.length > 0 && eligible.every(s => this.state.selectedByModel[modelKey]?.[s.session_id]);
+  },
+
+  _statusBar(model) {
+    const job = this.state.jobStatus?.[model.key];
+    if (!job) return '';
+    if (job.running) return `
+      <div class="seg-status-bar seg-status-bar--running">
+        <div class="rh-status-spinner"></div>
+        <span><strong>${model.label}</strong> — In corso ${job.current}/${job.total}${job.last_msg ? ' · ' + job.last_msg : ''}</span>
+      </div>`;
+    if (job.error) return `
+      <div class="seg-status-bar seg-status-bar--err"><strong>${model.label}</strong> — ✗ ${job.error}</div>`;
+    if (job.result) return `
+      <div class="seg-status-bar seg-status-bar--ok"><strong>${model.label}</strong> — ✓ ${job.last_msg || 'Completato'}</div>`;
+    return '';
   },
 
   render() {
     const app = document.getElementById('app');
     if (!app) return;
 
-    const job    = this.state.jobStatus?.[this.state.selectedModel];
-    const rows   = this.filtered();
-    const selIds = this.selectedIds();
-    const allChecked = rows.length > 0 && rows.every(s => this.state.selected[s.session_id]);
-    const model  = this.modelInfo();
-
-    const doneCount    = this.state.sessions.filter(s => (s.segmented_models || []).includes(this.state.selectedModel)).length;
-    const pendingCount = this.state.sessions.filter(s => !(s.segmented_models || []).includes(this.state.selectedModel) && s.preprocessing_ready).length;
+    const rows      = this.filtered();
+    const totalSel  = this.totalSelected();
+    const anyRunning = SEG_MODELS.some(m => this.state.jobStatus?.[m.key]?.running);
+    const nCols     = 5 + SEG_MODELS.length + 1;
 
     app.innerHTML = `
       <div class="seg-layout">
@@ -157,51 +196,24 @@ const SegView = {
         <div class="seg-header">
           <div>
             <div class="seg-title">Segmentation</div>
-            <div class="seg-subtitle">Seleziona pazienti e timepoint, scegli il modello e avvia la segmentazione.</div>
+            <div class="seg-subtitle">
+              Seleziona le sessioni e i modelli da applicare, poi premi Segmenta.
+              Le colonne modello mostrano lo stato per ciascun caso.
+            </div>
           </div>
           <div class="seg-header-actions">
-            <button class="btn btn-primary" id="seg-run-btn" ${job?.running || !selIds.length ? 'disabled' : ''}>
-              ▶ Segmenta selezionati (${selIds.length})
-            </button>
-          </div>
-        </div>
-
-        ${job?.running ? `
-          <div class="seg-status-bar seg-status-bar--running">
-            <div class="rh-status-spinner"></div>
-            <span>Segmentazione in corso… ${job.current}/${job.total}
-              ${job.last_msg ? '· ' + job.last_msg : ''}</span>
-          </div>
-        ` : job?.result ? `
-          <div class="seg-status-bar seg-status-bar--ok">
-            ✓ ${job.last_msg || 'Completato'}
-          </div>
-        ` : job?.error ? `
-          <div class="seg-status-bar seg-status-bar--err">✗ ${job.error}</div>
-        ` : ''}
-
-        <div class="seg-toolbar">
-          <div class="seg-model-selector">
-            ${SEG_MODELS.map(m => `
-              <button class="seg-model-btn ${m.key === this.state.selectedModel ? 'selected' : ''}"
-                      data-model="${m.key}" title="${m.description}">
-                <span class="seg-model-label">${m.label}</span>
-                <span class="seg-model-counts">
-                  <span class="seg-count-done">${doneCount} ✓</span>
-                  <span class="seg-count-pending">${pendingCount} in attesa</span>
-                </span>
-              </button>
-            `).join('')}
-          </div>
-
-          <div class="seg-filters">
+            <input class="f-search" id="seg-filter-q" placeholder="Cerca paziente, ID, dataset…" value="${this.state.filterQ}" style="width:180px">
             <label class="seg-filter-check">
               <input type="checkbox" id="seg-filter-preproc" ${this.state.filterPreproc ? 'checked' : ''}>
               Solo preprocessing pronto
             </label>
-            <input class="f-search" id="seg-filter-q" placeholder="Cerca paziente…" value="${this.state.filterQ}">
+            <button class="btn btn-primary" id="seg-run-btn" ${anyRunning || !totalSel ? 'disabled' : ''}>
+              ▶ Segmenta (${totalSel})
+            </button>
           </div>
         </div>
+
+        ${SEG_MODELS.map(m => this._statusBar(m)).join('')}
 
         ${this.state.loading ? `
           <div class="gm-loading"><div class="spinner"></div><span>Caricamento…</span></div>
@@ -210,47 +222,47 @@ const SegView = {
             <table class="import-table seg-table">
               <thead>
                 <tr>
-                  <th>
-                    <input type="checkbox" id="seg-select-all" ${allChecked ? 'checked' : ''}>
-                  </th>
                   <th>Paziente</th>
                   <th>Timepoint</th>
-                  <th>Data</th>
                   <th>Dataset</th>
+                  <th>Data</th>
                   <th>Preprocessing</th>
-                  <th>${model.label}</th>
+                  ${SEG_MODELS.map(m => `
+                    <th class="seg-model-col">
+                      <div class="seg-model-head">
+                        <label class="seg-cb-label" title="Seleziona tutti idonei per ${m.label}">
+                          <input type="checkbox" class="seg-all-cb" data-model="${m.key}"
+                                 ${this._allChecked(m.key, rows) ? 'checked' : ''}>
+                          <span class="seg-cb-mark"></span>
+                        </label>
+                        <span>${m.label}</span>
+                      </div>
+                    </th>
+                  `).join('')}
                   <th></th>
                 </tr>
               </thead>
               <tbody>
                 ${rows.length ? rows.map(s => {
-                  const checked = !!this.state.selected[s.session_id];
-                  const canSelect = s.preprocessing_ready && !(s.segmented_models || []).includes(this.state.selectedModel);
+                  const rowSel = SEG_MODELS.some(m => this.state.selectedByModel[m.key]?.[s.session_id]);
                   return `
-                    <tr class="${checked ? 'selected' : ''}">
-                      <td>
-                        <input type="checkbox" class="seg-cb"
-                               data-sid="${s.session_id}"
-                               ${checked ? 'checked' : ''}
-                               ${canSelect ? '' : 'disabled'}
-                               title="${canSelect ? '' : !s.preprocessing_ready ? 'Preprocessing non completato' : 'Già segmentato con questo modello'}">
-                      </td>
+                    <tr class="${rowSel ? 'selected' : ''}">
                       <td>
                         <div class="import-cell-title">${GlioTwin.patientPrimary(s)}</div>
-                        <div class="import-cell-sub">${GlioTwin.state.showSensitive ? GlioTwin.patientSecondary(s) : ''}</div>
+                        <div class="import-cell-sub">${GlioTwin.state.showSensitive ? GlioTwin.patientSecondary(s) : s.subject_id}</div>
                       </td>
                       <td>
                         <span class="tp-pill tp-${s.timepoint_type || 'other'}">${(s.timepoint_type || 'other').replace('_', ' ')}</span>
-                        <span class="import-cell-sub">${s.session_label}</span>
+                        <div class="import-cell-sub">${s.session_label}</div>
                       </td>
-                      <td class="import-cell-sub">${GlioTwin.fmtDate(s.study_date)}</td>
                       <td>${GlioTwin.datasetBadge(s.dataset)}</td>
+                      <td class="import-cell-sub">${GlioTwin.fmtDate(s.study_date)}</td>
                       <td>
                         ${s.preprocessing_ready
-                          ? '<span class="seg-chip seg-chip--done">✓ Pronto</span>'
-                          : '<span class="seg-chip seg-chip--wait">Mancante</span>'}
+                          ? '<span class="seg-chip seg-chip--done">✓ pronto</span>'
+                          : '<span class="seg-chip seg-chip--wait">mancante</span>'}
                       </td>
-                      <td>${this._modelChips(s)}</td>
+                      ${SEG_MODELS.map(m => `<td class="seg-model-col">${this._modelCell(s, m)}</td>`).join('')}
                       <td>
                         <button class="btn btn-linklike seg-viewer-btn"
                                 data-pid="${s.patient_id}" data-sid="${s.session_id}">Viewer</button>
@@ -258,7 +270,7 @@ const SegView = {
                     </tr>
                   `;
                 }).join('') : `
-                  <tr><td colspan="8" class="import-empty-cell">Nessuna sessione trovata.</td></tr>
+                  <tr><td colspan="${nCols}" class="import-empty-cell">Nessuna sessione trovata.</td></tr>
                 `}
               </tbody>
             </table>
@@ -273,30 +285,6 @@ const SegView = {
   _bindEvents(app) {
     app.querySelector('#seg-run-btn')?.addEventListener('click', () => this.runSelected());
 
-    app.querySelector('#seg-select-all')?.addEventListener('change', e => {
-      const rows = this.filtered();
-      rows.forEach(s => {
-        const canSelect = s.preprocessing_ready && !(s.segmented_models || []).includes(this.state.selectedModel);
-        if (canSelect) this.state.selected[s.session_id] = e.target.checked;
-      });
-      this.render();
-    });
-
-    app.querySelectorAll('.seg-cb').forEach(el => {
-      el.addEventListener('change', e => {
-        this.state.selected[parseInt(el.dataset.sid)] = e.target.checked;
-        this.render();
-      });
-    });
-
-    app.querySelectorAll('.seg-model-btn').forEach(el => {
-      el.addEventListener('click', () => {
-        this.state.selectedModel = el.dataset.model;
-        this.state.selected = {};
-        this.render();
-      });
-    });
-
     app.querySelector('#seg-filter-preproc')?.addEventListener('change', e => {
       this.state.filterPreproc = e.target.checked;
       this.render();
@@ -305,6 +293,28 @@ const SegView = {
     app.querySelector('#seg-filter-q')?.addEventListener('input', e => {
       this.state.filterQ = e.target.value;
       this.render();
+    });
+
+    app.querySelectorAll('.seg-all-cb').forEach(el => {
+      el.addEventListener('change', e => {
+        const key  = el.dataset.model;
+        const rows = this.filtered();
+        if (!this.state.selectedByModel[key]) this.state.selectedByModel[key] = {};
+        rows.forEach(s => {
+          if (this.canSelect(s, key)) this.state.selectedByModel[key][s.session_id] = e.target.checked;
+        });
+        this.render();
+      });
+    });
+
+    app.querySelectorAll('.seg-model-cb').forEach(el => {
+      el.addEventListener('change', e => {
+        const sid = parseInt(el.dataset.sid);
+        const key = el.dataset.model;
+        if (!this.state.selectedByModel[key]) this.state.selectedByModel[key] = {};
+        this.state.selectedByModel[key][sid] = e.target.checked;
+        this.render();
+      });
     });
 
     app.querySelectorAll('.seg-delete-btn').forEach(el => {
@@ -329,5 +339,6 @@ const SegView = {
 
 GlioTwin.register('rhglioseg', async (app) => {
   app.innerHTML = `<div class="gm-loading"><div class="spinner"></div><span>Caricamento…</span></div>`;
+  SegView._initSelected();
   await SegView.load();
 });

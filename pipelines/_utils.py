@@ -200,6 +200,6 @@ def insert_clinical_event(conn: sqlite3.Connection, subject_pk: int,
             rano_response, treatment_agent, description)
            VALUES (?,?,?,?,?,?,?)""",
         (subject_pk, session_pk, event_type, days,
-         kw.get('rano_response', 'not_applicable'),
+         kw.get('rano_response'),
          kw.get('treatment_agent'), kw.get('description')),
     )
