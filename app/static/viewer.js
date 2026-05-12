@@ -12,6 +12,13 @@ const GlioViewer = (() => {
       A: [0, 255],
       I: [0, 255],
     },
+    glio_red_dark: {
+      R: [0, 185],
+      G: [0, 28],
+      B: [0, 28],
+      A: [0, 255],
+      I: [0, 255],
+    },
     glio_yellow: {
       R: [0, 250],
       G: [0, 204],
@@ -30,6 +37,27 @@ const GlioViewer = (() => {
       R: [0, 34],
       G: [0, 197],
       B: [0, 94],
+      A: [0, 255],
+      I: [0, 255],
+    },
+    glio_green_dark: {
+      R: [0, 21],
+      G: [0, 128],
+      B: [0, 61],
+      A: [0, 255],
+      I: [0, 255],
+    },
+    glio_violet: {
+      R: [0, 167],
+      G: [0, 139],
+      B: [0, 250],
+      A: [0, 255],
+      I: [0, 255],
+    },
+    glio_violet_dark: {
+      R: [0, 124],
+      G: [0, 58],
+      B: [0, 237],
       A: [0, 255],
       I: [0, 255],
     },
@@ -52,15 +80,30 @@ const GlioViewer = (() => {
     tumor_mask:      'glio_red',
     rc:              'glio_green', resection_cavity:'glio_green',
     brain_mask:      'green',
+    malato:          'glio_red',
+    sano:            'glio_green',
   };
 
   function colormapFor(label) {
     return LABEL_COLORMAP[(label || '').toLowerCase()] || 'warm';
   }
 
+  const _blobCache = new Map();
+
   function fileUrl(relPath) {
     const encoded = relPath.split('/').map(encodeURIComponent).join('/');
-    return `/api/files/${encoded}`;
+    const url = `/api/files/${encoded}`;
+    return _blobCache.get(url) || url;
+  }
+
+  async function prefetch(relPath) {
+    const encoded = relPath.split('/').map(encodeURIComponent).join('/');
+    const url = `/api/files/${encoded}`;
+    if (_blobCache.has(url)) return;
+    try {
+      const r = await fetch(url);
+      if (r.ok) _blobCache.set(url, URL.createObjectURL(await r.blob()));
+    } catch(_) {}
   }
 
   function _clamp01(value) {
@@ -99,9 +142,16 @@ const GlioViewer = (() => {
 
   function _touchScene(nv) {
     if (!nv) return;
+    // nv.setOpacity su un indice > 0 chiama internamente updateGLVolume che
+    // rilegge TUTTE le opacity e le carica in GPU, poi ridisegna.
+    // Usiamolo come unico trigger del pipeline; fallback se non disponibile.
+    if (typeof nv.setOpacity === 'function' && nv.volumes?.length > 1) {
+      const ov = nv.volumes[1];
+      nv.setOpacity(1, ov?.opacity ?? 0);
+      return;
+    }
     if (typeof nv.updateGLVolume === 'function') nv.updateGLVolume();
     if (typeof nv.drawScene === 'function') nv.drawScene();
-    if (typeof nv.drawSceneCore === 'function') nv.drawSceneCore();
   }
 
   function _setVolumeOpacity(volume, opacity) {
@@ -171,8 +221,98 @@ const GlioViewer = (() => {
    * Load a sequence + overlays into a NiiVue instance.
    * Subsequent calls replace the previously loaded volume.
    */
+  // overlaysBySid: {[sessionId]: [{url, colormap}]} — opzionale
+  async function buildTimeline(nv, entries, overlaysBySid = null) {
+    const valid = entries.filter(e => e.path);
+    if (valid.length < 2) return false;
+
+    const volumes        = [];
+    const indexBySid     = new Map();
+    const ovIndexBySid   = new Map();
+
+    // Prima: immagini principali (una per sessione)
+    for (const e of valid) {
+      indexBySid.set(e.sessionId, volumes.length);
+      volumes.push({ url: fileUrl(e.path), colormap: e.colormap || 'gray', opacity: e.isActive ? 1 : 0 });
+    }
+
+    // Poi: overlay per ogni sessione
+    if (overlaysBySid) {
+      for (const e of valid) {
+        const ovs = overlaysBySid[e.sessionId] || [];
+        const idxList = [];
+        for (const ov of ovs) {
+          if (!ov?.url) continue;
+          idxList.push(volumes.length);
+          volumes.push({ url: ov.url, colormap: ov.colormap || colormapFor(ov.label || ''), opacity: e.isActive ? 1 : 0 });
+        }
+        ovIndexBySid.set(e.sessionId, idxList);
+      }
+    }
+
+    await nv.loadVolumes(volumes);
+    nv.__tlMeta = { indexBySid, ovIndexBySid: overlaysBySid ? ovIndexBySid : null };
+    return true;
+  }
+
+  // Blend continuo tra due sessioni adiacenti: t=0 → solo sid1, t=1 → solo sid2
+  function blendTimeline(nv, sid1, sid2, t) {
+    const meta = nv?.__tlMeta;
+    if (!meta) return false;
+    const idx1 = meta.indexBySid.get(sid1);
+    const idx2 = meta.indexBySid.get(sid2);
+    if (idx1 == null || idx2 == null) return false;
+
+    // Azzera tutte le sessioni non coinvolte direttamente sulle proprietà
+    for (const [sid, idx] of meta.indexBySid) {
+      if (sid !== sid1 && sid !== sid2 && nv.volumes[idx])
+        nv.volumes[idx].opacity = 0;
+    }
+    if (meta.ovIndexBySid) {
+      for (const [sid, idxList] of meta.ovIndexBySid) {
+        if (sid !== sid1 && sid !== sid2)
+          for (const i of idxList) if (nv.volumes[i]) nv.volumes[i].opacity = 0;
+      }
+      // sid1 rimane a piena opacità come "sfondo" del blend; sid2 sfuma sopra
+      for (const i of (meta.ovIndexBySid.get(sid1) || []))
+        if (nv.volumes[i]) nv.volumes[i].opacity = 1;
+      for (const i of (meta.ovIndexBySid.get(sid2) || []))
+        if (nv.volumes[i]) nv.volumes[i].opacity = t;
+    }
+    // sid1 pieno come base → sid2 sfuma su di esso: result = sid1*(1-t) + sid2*t
+    if (nv.volumes[idx1]) nv.volumes[idx1].opacity = 1;
+    if (nv.volumes[idx2]) nv.volumes[idx2].opacity = t;
+
+    _touchScene(nv);
+    return true;
+  }
+
+  function switchTimeline(nv, fromSid, toSid) {
+    const meta = nv?.__tlMeta;
+    if (!meta) return false;
+    const toIdx = meta.indexBySid.get(toSid);
+    if (toIdx == null) return false;
+    const fromIdx = meta.indexBySid.get(fromSid);
+
+    // Swap immagine principale
+    if (fromIdx != null && nv.volumes[fromIdx]) _setVolumeOpacity(nv.volumes[fromIdx], 0);
+    if (nv.volumes[toIdx]) _setVolumeOpacity(nv.volumes[toIdx], 1);
+
+    // Swap overlay
+    if (meta.ovIndexBySid) {
+      for (const idx of (meta.ovIndexBySid.get(fromSid) || []))
+        if (nv.volumes[idx]) _setVolumeOpacity(nv.volumes[idx], 0);
+      for (const idx of (meta.ovIndexBySid.get(toSid) || []))
+        if (nv.volumes[idx]) _setVolumeOpacity(nv.volumes[idx], 1);
+    }
+
+    _touchScene(nv);
+    return true;
+  }
+
   async function loadInto(nv, seqPath, overlays = []) {
     if (!nv) return;
+    nv.__tlMeta = null; // qualsiasi load diretto invalida la timeline
     const base = _normalizeSeriesItem(seqPath);
     const volumes = [];
     if (base.path) {
@@ -183,12 +323,12 @@ const GlioViewer = (() => {
         opacity:  1.0,
       });
     }
-    for (const { url, label, name } of overlays) {
+    for (const { url, label, name, colormap } of overlays) {
       if (!url) continue;
       volumes.push({
         url,
         name:     name || url.split('/').pop().split('?')[0],
-        colormap: colormapFor(label),
+        colormap: colormap || colormapFor(label),
         cal_min:  0,
         cal_max:  1,
         opacity:  0.68,
@@ -233,12 +373,12 @@ const GlioViewer = (() => {
       });
     });
 
-    for (const { url, label, name } of overlays) {
+    for (const { url, label, name, colormap } of overlays) {
       if (!url) continue;
       volumes.push({
         url,
         name:     name || url.split('/').pop().split('?')[0],
-        colormap: colormapFor(label),
+        colormap: colormap || colormapFor(label),
         cal_min:  0,
         cal_max:  1,
         opacity:  0.68,
@@ -321,12 +461,12 @@ const GlioViewer = (() => {
       });
     }
 
-    for (const { url, label, name } of overlays) {
+    for (const { url, label, name, colormap } of overlays) {
       if (!url) continue;
       volumes.push({
         url,
         name:     name || url.split('/').pop().split('?')[0],
-        colormap: colormapFor(label),
+        colormap: colormap || colormapFor(label),
         cal_min:  0,
         cal_max:  1,
         opacity:  0.68,
@@ -444,6 +584,27 @@ const GlioViewer = (() => {
     nv.drawScene?.();
   }
 
+  // sliceType: 0=axial, 1=coronal, 2=sagittal  |  delta: +1 avanti, -1 indietro
+  function scrollSlice(nv, sliceType, delta) {
+    if (!nv) return;
+    if (typeof nv.moveCrosshairInVox === 'function') {
+      if      (sliceType === 2) nv.moveCrosshairInVox(delta, 0, 0); // sagittal → X
+      else if (sliceType === 1) nv.moveCrosshairInVox(0, delta, 0); // coronal  → Y
+      else                      nv.moveCrosshairInVox(0, 0, delta); // axial    → Z
+      return;
+    }
+    // Fallback: sposta la crosshair direttamente su scene.crosshairPos (frac 0–1)
+    if (!nv.volumes?.length || !nv.scene) return;
+    const vol  = nv.volumes[0];
+    const dims = [vol.hdr?.dims?.[1] ?? 256, vol.hdr?.dims?.[2] ?? 256, vol.hdr?.dims?.[3] ?? 256];
+    const pos  = [...(nv.scene.crosshairPos ?? [0.5, 0.5, 0.5])];
+    const axis = sliceType === 2 ? 0 : sliceType === 1 ? 1 : 2;
+    pos[axis]  = Math.max(0, Math.min(1, pos[axis] + delta / dims[axis]));
+    nv.scene.crosshairPos = pos;
+    _touchScene(nv);
+  }
+
   return { createInstance, loadInto, preloadBlendSet, setBlendState, loadBlendInto, linkAll,
-           colormapFor, fileUrl, attachZoom, resetZoom, zoomIn, zoomOut, attachVoxelReadout, getVolumeRange, applyWL };
+           colormapFor, fileUrl, prefetch, buildTimeline, switchTimeline, blendTimeline, scrollSlice,
+           attachZoom, resetZoom, zoomIn, zoomOut, attachVoxelReadout, getVolumeRange, applyWL };
 })();

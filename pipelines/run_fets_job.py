@@ -14,9 +14,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.services.fets_finalize import sync_fets_brain_outputs
+import SimpleITK as sitk
+
+from app.services.fets_finalize import sync_fets_brain_outputs, FINAL_ROOT
 from app.services.processing_jobs import dispatch_next_job
 from app.services.pipeline_state import ensure_state, update_step
+from app.services.rtstruct_import import scan_session_for_rtstruct
 
 INPUT_ROOT = Path("/mnt/dati/irst_data/processing_jobs")
 WRAPPER = Path(__file__).resolve().with_name("run_fets_patient.sh")
@@ -33,6 +36,17 @@ CORE_IMPORT_CLASS = {
     "T1ce": "t1c",
     "T2": "t2w",
     "FLAIR": "t2f",
+}
+
+SITK_SUFFIX = {
+    "T1":    "_t1n.nii.gz",
+    "T1ce":  "_t1c.nii.gz",
+    "T2":    "_t2w.nii.gz",
+    "FLAIR": "_t2f.nii.gz",
+    "APT":    "_apt.nii.gz",
+    "DWI":    "_dwi.nii.gz",
+    "Ktrans": "_ktrans.nii.gz",
+    "nrCBV":  "_nrcbv.nii.gz",
 }
 
 
@@ -136,6 +150,161 @@ def prepare_input(case: dict, job_root: Path) -> Path:
     return job_root / "input"
 
 
+def _read_dicom_series(dicom_dir: str) -> sitk.Image:
+    reader = sitk.ImageSeriesReader()
+    files = reader.GetGDCMSeriesFileNames(dicom_dir)
+    if not files:
+        raise RuntimeError(f"No DICOM files found in {dicom_dir}")
+    reader.SetFileNames(files)
+    return reader.Execute()
+
+
+def _read_dicom_filtered(dicom_dir: str, imagetype_keyword: str) -> sitk.Image:
+    """Legge una serie DICOM tenendo solo i file il cui ImageType contiene la keyword.
+
+    Ordina per ImagePositionPatient.z (come GetGDCMSeriesFileNames), non per
+    nome file, per garantire una ricostruzione 3D corretta.
+    """
+    import pydicom
+    candidates = []
+    for fname in os.listdir(dicom_dir):
+        fpath = str(Path(dicom_dir) / fname)
+        try:
+            ds = pydicom.dcmread(fpath, stop_before_pixels=True)
+            it = [x.upper() for x in getattr(ds, "ImageType", [])]
+            if imagetype_keyword.upper() not in it:
+                continue
+            pos = getattr(ds, "ImagePositionPatient", None)
+            z = float(pos[2]) if pos and len(pos) >= 3 else float(getattr(ds, "InstanceNumber", 0))
+            candidates.append((z, fpath))
+        except Exception:
+            continue
+    if not candidates:
+        raise RuntimeError(
+            f"Nessun file con ImageType '{imagetype_keyword}' in {dicom_dir}"
+        )
+    candidates.sort(key=lambda x: x[0])
+    reader = sitk.ImageSeriesReader()
+    reader.SetFileNames([fpath for _, fpath in candidates])
+    return reader.Execute()
+
+
+def _resample_to_1mm(img: sitk.Image) -> sitk.Image:
+    orig_spacing = img.GetSpacing()
+    orig_size = img.GetSize()
+    new_spacing = [1.0, 1.0, 1.0]
+    new_size = [int(round(orig_size[i] * orig_spacing[i])) for i in range(3)]
+    resampler = sitk.ResampleImageFilter()
+    resampler.SetOutputSpacing(new_spacing)
+    resampler.SetSize(new_size)
+    resampler.SetOutputDirection(img.GetDirection())
+    resampler.SetOutputOrigin(img.GetOrigin())
+    resampler.SetInterpolator(sitk.sitkLinear)
+    resampler.SetDefaultPixelValue(0.0)
+    resampler.SetTransform(sitk.Transform())
+    return sitk.Cast(resampler.Execute(img), sitk.sitkFloat32)
+
+
+def _outputs_are_ready(expected: dict[str, str]) -> bool:
+    """True se tutti i file attesi esistono su disco e sono già a 1mm iso."""
+    import nibabel as nib
+    for path in expected.values():
+        p = Path(path)
+        if not p.exists():
+            return False
+        try:
+            zooms = nib.load(str(p)).header.get_zooms()[:3]
+            if not all(abs(z - 1.0) < 0.15 for z in zooms):
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def run_sitk_preprocessing(
+    case: dict,
+    log,
+    conn: sqlite3.Connection,
+) -> str:
+    subject_id = case["subject_id"]
+    session_label = case["session_label"]
+    session_id = case["session_id"]
+    sequences = case["sequences"]
+
+    out_dir = FINAL_ROOT / subject_id / session_label
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    expected_outputs = {
+        seq_type: str(out_dir / f"{subject_id}_{session_label}{suffix}")
+        for seq_type, suffix in SITK_SUFFIX.items()
+        if sequences.get(seq_type, {}).get("raw_path")
+    }
+
+    if _outputs_are_ready(expected_outputs):
+        log.write(f"[sitk] output 1mm già presenti, skip conversione\n")
+        for seq_type, out_path in expected_outputs.items():
+            execute_with_retry(
+                conn,
+                "UPDATE sequences SET processed_path = ? WHERE session_id = ? AND sequence_type = ?",
+                (out_path, session_id, seq_type),
+                commit=True,
+            )
+        return str(out_dir)
+
+    ref_type = next(
+        (k for k in ("T1ce", "T1") if sequences.get(k, {}).get("raw_path")),
+        None,
+    )
+    if not ref_type:
+        raise RuntimeError("No reference sequence (T1ce or T1) available")
+
+    log.write(f"[sitk] reference={ref_type}\n")
+    log.flush()
+
+    ref_img_native = _read_dicom_series(sequences[ref_type]["raw_path"])
+    ref_img = _resample_to_1mm(ref_img_native)
+    ref_out = out_dir / f"{subject_id}_{session_label}{SITK_SUFFIX[ref_type]}"
+    sitk.WriteImage(ref_img, str(ref_out))
+    log.write(f"[sitk] {ref_type} → {ref_out.name} shape={ref_img.GetSize()} spacing={ref_img.GetSpacing()}\n")
+    execute_with_retry(
+        conn,
+        "UPDATE sequences SET processed_path = ? WHERE session_id = ? AND sequence_type = ?",
+        (str(ref_out), session_id, ref_type),
+        commit=True,
+    )
+
+    for seq_type, suffix in SITK_SUFFIX.items():
+        if seq_type == ref_type:
+            continue
+        raw_path = sequences.get(seq_type, {}).get("raw_path")
+        if not raw_path:
+            continue
+        log.write(f"[sitk] {seq_type}: DICOM → NIfTI 1mm float32 ...\n")
+        log.flush()
+        if seq_type == "APT":
+            moving = _read_dicom_filtered(raw_path, "APTW")
+        else:
+            moving = _read_dicom_series(raw_path)
+        resampler = sitk.ResampleImageFilter()
+        resampler.SetReferenceImage(ref_img)
+        resampler.SetInterpolator(sitk.sitkLinear)
+        resampler.SetDefaultPixelValue(0.0)
+        resampler.SetTransform(sitk.Transform())
+        resampled = sitk.Cast(resampler.Execute(moving), sitk.sitkFloat32)
+        out_path = out_dir / f"{subject_id}_{session_label}{suffix}"
+        sitk.WriteImage(resampled, str(out_path))
+        log.write(f"[sitk] {seq_type} → {out_path.name}\n")
+        execute_with_retry(
+            conn,
+            "UPDATE sequences SET processed_path = ? WHERE session_id = ? AND sequence_type = ?",
+            (str(out_path), session_id, seq_type),
+            commit=True,
+        )
+
+    log.write(f"[sitk] done → {out_dir}\n")
+    return str(out_dir)
+
+
 def discover_run_dir(run_root: Path, subject_id: str) -> Path:
     matches = sorted(run_root.glob(f"{subject_id}_*"))
     if not matches:
@@ -172,6 +341,12 @@ def main() -> int:
             session_id=case["session_id"],
             dataset="irst_dicom_raw",
         )
+
+        fets_capable = all(
+            case["sequences"].get(k, {}).get("raw_path")
+            for k in ("T1", "T1ce", "T2", "FLAIR")
+        )
+
         update_job(
             conn,
             job_id,
@@ -182,97 +357,116 @@ def main() -> int:
             error_message=None,
         )
         with worker_log.open("a", encoding="utf-8") as log:
-            log.write(f"[job {job_id}] prepare_input\n")
-            input_root = prepare_input(case, job_root)
-            run_root = job_root / "runs"
-            run_root.mkdir(parents=True, exist_ok=True)
-            update_job(conn, job_id, progress_stage="running_fets")
-            cmd = [
-                str(WRAPPER),
-                "--paziente",
-                case["subject_id"],
-                "--input",
-                str(input_root),
-                "--output",
-                str(run_root),
-                "--mode",
-                "brain",
-            ]
-            if USE_GPU:
-                cmd.extend(["--gpu", GPU_ID])
-            else:
-                cmd.append("--no-gpu")
-            log.write("[job {}] {}\n".format(job_id, " ".join(cmd)))
-            log.flush()
-            proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, text=True)
-            if proc.returncode != 0:
-                raise RuntimeError(f"FeTS wrapper failed with exit code {proc.returncode}")
+            if fets_capable:
+                log.write(f"[job {job_id}] mode=fets\n")
+                input_root = prepare_input(case, job_root)
+                run_root = job_root / "runs"
+                run_root.mkdir(parents=True, exist_ok=True)
+                update_job(conn, job_id, progress_stage="running_fets")
+                cmd = [
+                    str(WRAPPER),
+                    "--paziente",
+                    case["subject_id"],
+                    "--input",
+                    str(input_root),
+                    "--output",
+                    str(run_root),
+                    "--mode",
+                    "brain",
+                ]
+                if USE_GPU:
+                    cmd.extend(["--gpu", GPU_ID])
+                else:
+                    cmd.append("--no-gpu")
+                log.write("[job {}] {}\n".format(job_id, " ".join(cmd)))
+                log.flush()
+                proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, text=True)
+                if proc.returncode != 0:
+                    raise RuntimeError(f"FeTS wrapper failed with exit code {proc.returncode}")
 
-            update_job(conn, job_id, progress_stage="completed")
-            run_dir = discover_run_dir(run_root, case["subject_id"])
-            update_step(
-                case["subject_id"],
-                case["session_label"],
-                "initial_validation",
-                status="done",
-                output_path=str(job_root / "input"),
-                error_message=None,
-                started=True,
-                finished=True,
-                session_id=case["session_id"],
-                dataset="irst_dicom_raw",
-            )
-            update_step(
-                case["subject_id"],
-                case["session_label"],
-                "nifti_conversion",
-                status="done",
-                output_path=str(run_dir / "output"),
-                error_message=None,
-                started=True,
-                finished=True,
-                session_id=case["session_id"],
-                dataset="irst_dicom_raw",
-            )
-            update_step(
-                case["subject_id"],
-                case["session_label"],
-                "brain_extraction",
-                status="done",
-                output_path=str(run_dir / "output"),
-                error_message=None,
-                started=True,
-                finished=True,
-                session_id=case["session_id"],
-                dataset="irst_dicom_raw",
-            )
-            sync_result = sync_fets_brain_outputs(case["session_id"], str(run_dir))
-            update_job(
-                conn,
-                job_id,
-                status="completed",
-                progress_stage="completed",
-                run_dir=str(run_dir),
-                final_dir=sync_result["processed_dir"],
-                return_code=0,
-            )
-            log.write(f"FETS_OK {run_dir}\n")
-        execute_with_retry(
-            conn,
-            """
-            UPDATE processing_jobs
-            SET status='completed',
-                progress_stage='completed',
-                run_dir=?,
-                final_dir=?,
-                return_code=0,
-                finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-                updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-            WHERE id=?
-            """,
-            (str(run_dir), sync_result["processed_dir"], job_id),
-            commit=True,
-        )
+                update_job(conn, job_id, progress_stage="completed")
+                run_dir = discover_run_dir(run_root, case["subject_id"])
+                update_step(
+                    case["subject_id"], case["session_label"], "initial_validation",
+                    status="done", output_path=str(job_root / "input"),
+                    error_message=None, started=True, finished=True,
+                    session_id=case["session_id"], dataset="irst_dicom_raw",
+                )
+                update_step(
+                    case["subject_id"], case["session_label"], "nifti_conversion",
+                    status="done", output_path=str(run_dir / "output"),
+                    error_message=None, started=True, finished=True,
+                    session_id=case["session_id"], dataset="irst_dicom_raw",
+                )
+                update_step(
+                    case["subject_id"], case["session_label"], "brain_extraction",
+                    status="done", output_path=str(run_dir / "output"),
+                    error_message=None, started=True, finished=True,
+                    session_id=case["session_id"], dataset="irst_dicom_raw",
+                )
+                sync_result = sync_fets_brain_outputs(case["session_id"], str(run_dir))
+                update_job(
+                    conn, job_id,
+                    status="completed", progress_stage="completed",
+                    run_dir=str(run_dir), final_dir=sync_result["processed_dir"],
+                    return_code=0,
+                )
+                log.write(f"FETS_OK {run_dir}\n")
+                execute_with_retry(
+                    conn,
+                    """
+                    UPDATE processing_jobs
+                    SET status='completed', progress_stage='completed',
+                        run_dir=?, final_dir=?, return_code=0,
+                        finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                        updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                    WHERE id=?
+                    """,
+                    (str(run_dir), sync_result["processed_dir"], job_id),
+                    commit=True,
+                )
+                try:
+                    rts = scan_session_for_rtstruct(case["session_id"], case["subject_id"], case["session_label"])
+                    if rts:
+                        log.write(f"[rtstruct] importati {sum(r.get('inserted',0)+r.get('updated',0) for r in rts)} ROI\n")
+                except Exception as _rts_exc:
+                    log.write(f"[rtstruct] warning: {_rts_exc}\n")
+            else:
+                log.write(f"[job {job_id}] mode=sitk (T1/T2 not available)\n")
+                update_job(conn, job_id, progress_stage="nifti_conversion")
+                out_dir = run_sitk_preprocessing(case, log, conn)
+                update_step(
+                    case["subject_id"], case["session_label"], "initial_validation",
+                    status="done", output_path=out_dir,
+                    error_message=None, started=True, finished=True,
+                    session_id=case["session_id"], dataset="irst_dicom_raw",
+                )
+                update_step(
+                    case["subject_id"], case["session_label"], "nifti_conversion",
+                    status="done", output_path=out_dir,
+                    error_message=None, started=True, finished=True,
+                    session_id=case["session_id"], dataset="irst_dicom_raw",
+                )
+                log.write(f"SITK_OK {out_dir}\n")
+                execute_with_retry(
+                    conn,
+                    """
+                    UPDATE processing_jobs
+                    SET status='completed', progress_stage='completed',
+                        run_dir=?, final_dir=?, return_code=0,
+                        finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                        updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                    WHERE id=?
+                    """,
+                    (out_dir, out_dir, job_id),
+                    commit=True,
+                )
+                try:
+                    rts = scan_session_for_rtstruct(case["session_id"], case["subject_id"], case["session_label"])
+                    if rts:
+                        log.write(f"[rtstruct] importati {sum(r.get('inserted',0)+r.get('updated',0) for r in rts)} ROI\n")
+                except Exception as _rts_exc:
+                    log.write(f"[rtstruct] warning: {_rts_exc}\n")
         return 0
     except Exception as exc:
         case_ref = locals().get("case")

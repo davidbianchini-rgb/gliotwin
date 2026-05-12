@@ -303,11 +303,23 @@ def init_db(db_path: Path = DB_PATH) -> None:
     sql = SCHEMA_PATH.read_text(encoding="utf-8")
     with sqlite3.connect(db_path, timeout=SQLITE_TIMEOUT_SECONDS) as conn:
         conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
-        conn.execute("PRAGMA journal_mode = WAL")
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+        except sqlite3.OperationalError:
+            pass  # filesystem senza WAL (NFS, lock corrotti) — usa journal di default
         conn.execute("PRAGMA foreign_keys = ON")
-        conn.executescript(sql)
+        already_initialized = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='subjects'"
+        ).fetchone()[0] > 0
+        if not already_initialized:
+            # DB nuovo: executescript va bene, nessun WAL pending
+            conn.executescript(sql)
+        # _run_migrations usa execute() singoli, non triggera commit WAL implicito
         _run_migrations(conn)
-        conn.commit()
+        try:
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # se il filesystem non permette scrittura, le tabelle esistono già
 
 
 @contextmanager
@@ -316,7 +328,10 @@ def get_conn(db_path: Path = DB_PATH):
     conn = sqlite3.connect(db_path, timeout=SQLITE_TIMEOUT_SECONDS)
     conn.row_factory = sqlite3.Row
     conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
-    conn.execute("PRAGMA journal_mode = WAL")
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.OperationalError:
+        pass
     conn.execute("PRAGMA foreign_keys = ON")
     try:
         yield conn

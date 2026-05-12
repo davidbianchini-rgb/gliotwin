@@ -184,22 +184,34 @@ def _import_session(conn: sqlite3.Connection, subject_pk: int,
                     (str(reg_path), seq_pk),
                 )
 
-    # ── HD-GLIO-AUTO segmentazione nativa T1ce ────────────────────
+    # ── HD-GLIO-AUTO segmentazioni native (origspace) ─────────────
     hd_native = week_dir / 'HD-GLIO-AUTO-segmentation' / 'native'
-    if not hd_native.exists():
-        return
+    if hd_native.exists():
+        seg_path = hd_native / 'segmentation_CT1_origspace.nii.gz'
+        if seg_path.exists() and not is_partial(seg_path) and _is_native_lumiere_seg(seg_path):
+            seq_pk = seq_pks.get('T1ce')
+            for label_code, label_name in HD_LABELS.items():
+                insert_computed_structure(
+                    conn, session_pk, seq_pk,
+                    label=label_name,
+                    label_code=label_code,
+                    mask_path=str(seg_path),
+                    model_name='HD-GLIO-AUTO-native',
+                    reference_space='native',
+                )
 
-    seg_path = hd_native / 'segmentation_CT1_origspace.nii.gz'
-    if seg_path.exists() and not is_partial(seg_path) and _is_native_lumiere_seg(seg_path):
+    # ── HD-GLIO-AUTO segmentazione registered ─────────────────────
+    seg_reg_path = hd_reg / 'segmentation.nii.gz'
+    if seg_reg_path.exists() and not is_partial(seg_reg_path):
         seq_pk = seq_pks.get('T1ce')
         for label_code, label_name in HD_LABELS.items():
             insert_computed_structure(
                 conn, session_pk, seq_pk,
                 label=label_name,
                 label_code=label_code,
-                mask_path=str(seg_path),
-                model_name='HD-GLIO-AUTO',
-                reference_space='native',
+                mask_path=str(seg_reg_path),
+                model_name='HD-GLIO-AUTO-registered',
+                reference_space='registered',
             )
 
     # ── RANO response come clinical event ─────────────────────────

@@ -12,7 +12,10 @@ import pandas as pd
 from fastapi import HTTPException
 
 from app.db import db, rows_as_dicts
-from app.services.clinical_timeline import sync_subject_timeline_offsets
+from app.services.clinical_timeline import (
+    sync_dataset_timeline_offsets,
+    sync_subject_timeline_offsets,
+)
 from app.services.subject_identity import (
     add_subject_alias,
     create_subject,
@@ -653,6 +656,12 @@ def commit_rt_excel(file_path: str, dataset: str = DEFAULT_RT_DATASET) -> dict[s
     imported_subjects: list[dict[str, Any]] = []
 
     source_rows = {row.row_index: row for row in _read_excel_rows(Path(resolved))}
+    timeline_sync = {
+        "subjects_seen": 0,
+        "subjects_synced": 0,
+        "clinical_events_updated": 0,
+        "sessions_updated": 0,
+    }
 
     with db() as conn:
         _cleanup_nat_values(conn)
@@ -725,6 +734,7 @@ def commit_rt_excel(file_path: str, dataset: str = DEFAULT_RT_DATASET) -> dict[s
                     "fractions_count": source_row.fractions_count,
                 }
             )
+        timeline_sync = sync_dataset_timeline_offsets(conn, dataset)
 
     return {
         "file_path": resolved,
@@ -736,6 +746,7 @@ def commit_rt_excel(file_path: str, dataset: str = DEFAULT_RT_DATASET) -> dict[s
             "skipped_ambiguous": skipped_ambiguous,
             "skipped_unmatched": skipped_unmatched,
         },
+        "timeline_sync": timeline_sync,
         "imported_subjects": imported_subjects,
         "rows": analysis["rows"],
     }

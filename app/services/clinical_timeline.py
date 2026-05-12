@@ -113,3 +113,30 @@ def sync_subject_timeline_offsets(conn: sqlite3.Connection, subject_id: int) -> 
         conn.execute("UPDATE sessions SET days_from_baseline = ? WHERE id = ?", (calc_days, row[0]))
         stats["sessions_updated"] += 1
     return stats
+
+
+def sync_dataset_timeline_offsets(conn: sqlite3.Connection, dataset: str) -> dict[str, int]:
+    stats = {
+        "subjects_seen": 0,
+        "subjects_synced": 0,
+        "clinical_events_updated": 0,
+        "sessions_updated": 0,
+    }
+    subject_rows = conn.execute(
+        """
+        SELECT id
+        FROM subjects
+        WHERE dataset = ?
+        ORDER BY id
+        """,
+        (dataset,),
+    ).fetchall()
+    for row in subject_rows:
+        subject_id = int(row[0])
+        stats["subjects_seen"] += 1
+        result = sync_subject_timeline_offsets(conn, subject_id)
+        if result["clinical_events_updated"] or result["sessions_updated"]:
+            stats["subjects_synced"] += 1
+        stats["clinical_events_updated"] += result["clinical_events_updated"]
+        stats["sessions_updated"] += result["sessions_updated"]
+    return stats

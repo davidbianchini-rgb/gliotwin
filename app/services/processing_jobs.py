@@ -17,6 +17,7 @@ RUNNER_PATH = Path(__file__).resolve().parents[2] / "pipelines" / "run_fets_job.
 PYTHON_BIN = Path("/home/irst/miniconda3/bin/python")
 TARGET_DATASET = "irst_dicom_raw"
 CORE_SEQUENCE_TYPES = ("T1", "T1ce", "T2", "FLAIR")
+REFERENCE_SEQUENCE_TYPES = ("T1ce", "T1")
 
 STEP_KEYS = [
     "import_dicom",
@@ -277,7 +278,8 @@ def _needs_brain_output_sync(conn, job: dict) -> bool:
         (session_id,),
     ).fetchall()
     core_rows = {row["sequence_type"]: row["processed_path"] for row in rows if row["sequence_type"] in CORE_SEQUENCE_TYPES}
-    return any(not core_rows.get(sequence_type) for sequence_type in CORE_SEQUENCE_TYPES)
+    present = [t for t in CORE_SEQUENCE_TYPES if t in core_rows]
+    return bool(present) and any(not core_rows[t] for t in present)
 
 
 def _sync_pipeline_state(conn, job: dict) -> dict | None:
@@ -714,8 +716,12 @@ def _sync_job_state(conn, job_row) -> dict:
 def _core_status_for_session(session_row: dict, sequences: list[dict], jobs: list[dict], computed_count: int) -> dict:
     core_map = {seq["sequence_type"]: seq for seq in sequences if seq["sequence_type"] in CORE_SEQUENCE_TYPES}
     has_all_core = all(k in core_map and core_map[k].get("raw_path") for k in CORE_SEQUENCE_TYPES)
-    has_processed = all(k in core_map and core_map[k].get("processed_path") for k in CORE_SEQUENCE_TYPES)
+    has_reference = any(k in core_map and core_map[k].get("raw_path") for k in REFERENCE_SEQUENCE_TYPES)
+    existing_core = [k for k in CORE_SEQUENCE_TYPES if k in core_map]
+    has_processed = bool(existing_core) and all(core_map[k].get("processed_path") for k in existing_core)
     latest_job = jobs[0] if jobs else None
+
+    preprocessing_mode = "fets" if has_all_core else ("sitk" if has_reference else None)
 
     if latest_job and latest_job["status"] == "running":
         operational_status = "running"
@@ -723,18 +729,22 @@ def _core_status_for_session(session_row: dict, sequences: list[dict], jobs: lis
         operational_status = "queued"
     elif has_processed and computed_count > 0:
         operational_status = "completed"
+    elif latest_job and latest_job["status"] == "completed":
+        operational_status = "completed"
     elif latest_job and latest_job["status"] == "failed":
         operational_status = "failed"
     elif latest_job and latest_job["status"] == "cancelled":
         operational_status = "cancelled"
-    elif has_all_core:
+    elif has_reference:
         operational_status = "ready"
     else:
         operational_status = "incomplete"
 
     return {
         "has_all_core": has_all_core,
+        "has_reference": has_reference,
         "has_processed": has_processed,
+        "preprocessing_mode": preprocessing_mode,
         "operational_status": operational_status,
         "latest_job": latest_job,
     }

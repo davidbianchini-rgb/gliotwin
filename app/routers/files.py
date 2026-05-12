@@ -118,18 +118,21 @@ async def serve_file(
 
     processed = _process_nifti(resolved, file_path, label_code, outline)
 
+    _CACHE = "max-age=86400"
+
     if processed is not None:
         headers = {
             "Accept-Ranges": "bytes",
             "Content-Type": "application/octet-stream",
             "Content-Length": str(len(processed)),
+            "Cache-Control": _CACHE,
         }
         if request.method == "HEAD":
             return Response(status_code=200, headers=headers)
         return Response(
             content=processed,
             media_type="application/octet-stream",
-            headers={"Accept-Ranges": "bytes"},
+            headers={"Accept-Ranges": "bytes", "Cache-Control": _CACHE},
         )
 
     # ── Plain serve ───────────────────────────────────────────────
@@ -140,11 +143,12 @@ async def serve_file(
                 "Accept-Ranges": "bytes",
                 "Content-Length": str(resolved.stat().st_size),
                 "Content-Type": "application/octet-stream",
+                "Cache-Control": _CACHE,
             },
         )
 
     return FileResponse(
         path=resolved,
         media_type="application/octet-stream",
-        headers={"Accept-Ranges": "bytes"},
+        headers={"Accept-Ranges": "bytes", "Cache-Control": _CACHE},
     )

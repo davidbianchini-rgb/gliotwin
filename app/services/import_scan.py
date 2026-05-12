@@ -219,6 +219,11 @@ def _special_class_label(ds: Any, class_label: str, series_desc: str, protocol_n
         if _looks_like_secondary_apt(series_desc, protocol_name, image_type_values, sop_class_uid):
             return "other"
         return "apt"
+    it_upper = [v.upper() for v in image_type_values]
+    if "KTRANS" in it_upper or "KTRANS" in joined:
+        return "ktrans"
+    if any(k in it_upper for k in ("RCBVCORR", "RCBV")) or re.search(r"\bNRCBV\b|\bRCBV\b", joined):
+        return "nrcbv"
     return class_label
 
 
@@ -253,6 +258,10 @@ def _match_rule(series_desc: str, protocol_name: str) -> tuple[str, int | None, 
         return "t2f", None, "fallback"
     if "T2W" in joined or re.search(r"\bT2\b", joined):
         return "t2w", None, "fallback"
+    if "KTRANS" in joined:
+        return "ktrans", None, "fallback"
+    if re.search(r"\bNRCBV\b|\bRCBV\b", joined) or "PERFUSIONE" in joined:
+        return "nrcbv", None, "fallback"
     return "other", None, None
 
 
@@ -491,13 +500,18 @@ def scan_dicom_root(root_path: str, limit_studies: int | None = None) -> dict[st
             "exams": [],
         }
 
+    # Raggruppa per (patient_id, cartella_studio_assoluta) per unire serie dello stesso
+    # studio che hanno StudyInstanceUID diversi (anomalia presente in alcuni dataset IRST).
+    _merge_key_to_canonical: dict[tuple[str, str], tuple[str, str]] = {}
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for series in raw_series:
-        study_key = (
-            series["patient_id"],
-            series["study_instance_uid"] or series["study_folder"],
-        )
-        grouped[study_key].append(series)
+        patient_id = series["patient_id"]
+        study_uid = series["study_instance_uid"] or series["study_folder"]
+        abs_study_dir = str(Path(series["source_dir"]).parent)
+        merge_key = (patient_id, abs_study_dir)
+        if merge_key not in _merge_key_to_canonical:
+            _merge_key_to_canonical[merge_key] = (patient_id, study_uid)
+        grouped[_merge_key_to_canonical[merge_key]].append(series)
 
     patient_studies: dict[str, list[tuple[tuple[str, str], list[dict[str, Any]]]]] = defaultdict(list)
     for key, items in grouped.items():

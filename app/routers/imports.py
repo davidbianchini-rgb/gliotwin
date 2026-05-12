@@ -367,6 +367,49 @@ def get_import_roots():
     return {"roots": list_scan_roots()}
 
 
+@router.get("/import/browse")
+def browse_directory(path: str = ""):
+    from app.services.import_scan import ALLOWED_SCAN_ROOTS
+
+    if not path:
+        return {
+            "path": "",
+            "parent": None,
+            "entries": [
+                {"name": str(r), "path": str(r), "is_dir": True}
+                for r in ALLOWED_SCAN_ROOTS
+                if r.exists()
+            ],
+        }
+
+    resolved = Path(path).expanduser().resolve()
+    if not any(str(resolved).startswith(str(base)) for base in ALLOWED_SCAN_ROOTS):
+        raise HTTPException(403, "Path outside allowed roots")
+    if not resolved.exists():
+        raise HTTPException(404, f"Path not found: {path}")
+    if not resolved.is_dir():
+        raise HTTPException(400, "Path is not a directory")
+
+    try:
+        entries = sorted(resolved.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+    except PermissionError:
+        raise HTTPException(403, "Permission denied")
+
+    parent = str(resolved.parent) if resolved.parent != resolved else None
+    if parent and not any(str(Path(parent)).startswith(str(base)) for base in ALLOWED_SCAN_ROOTS):
+        parent = None
+
+    return {
+        "path": str(resolved),
+        "parent": parent,
+        "entries": [
+            {"name": e.name, "path": str(e), "is_dir": e.is_dir()}
+            for e in entries
+            if not e.name.startswith(".")
+        ],
+    }
+
+
 @router.get("/import/mu/status")
 def mu_import_status(root_path: str = "/mnt/dati/MU-Glioma-Post"):
     with _mu_job_lock:

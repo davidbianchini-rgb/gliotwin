@@ -1072,7 +1072,7 @@ const ImportView = {
             <div class="import-inline-title">DICOM source</div>
             <div class="import-control-grid import-control-grid-compact">
               <label class="import-field">
-                <span>Server path</span>
+                <span>Cartella</span>
                 <input id="import-root" class="import-input" list="import-roots" value="${this.state.selectedRoot || ''}" placeholder="/mnt/dati/irst_data/irst_dicom_raw/DICOM GBM">
                 <datalist id="import-roots">
                   ${(this.state.roots || []).map(root => `<option value="${root}"></option>`).join('')}

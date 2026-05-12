@@ -10,6 +10,7 @@ from fastapi import HTTPException
 from app.db import db
 from app.services.import_scan import REQUIRED_CLASSES, _image_type_values, _read_anchor, scan_dicom_root
 from app.services.pipeline_state import ensure_state, reset_downstream_steps, update_step
+from app.services.rtstruct_import import find_and_import_rtstruct_series
 from app.services.subject_identity import (
     add_subject_alias,
     create_subject,
@@ -34,7 +35,8 @@ CLASS_TO_SEQUENCE = {
     "adc": ("ADC", 0),
     "swi": ("SWAN", 0),
     "perf": ("DSC", 0),
-    "ktrans": ("CBV", 0),
+    "ktrans": ("Ktrans", 0),
+    "nrcbv":  ("nrCBV", 0),
     "apt": ("APT", 0),
 }
 
@@ -107,14 +109,18 @@ def _upsert_subject(conn, exam: dict[str, Any]) -> dict[str, Any]:
         alias_value=exam["patient_id"],
         raw_value=exam["patient_id"],
     )
-    add_subject_alias(
-        conn,
-        int(row["id"]),
-        source_system="dicom",
-        alias_type="patient_folder",
-        alias_value=exam["patient_folder"],
-        raw_value=exam["patient_folder"],
-    )
+    try:
+        add_subject_alias(
+            conn,
+            int(row["id"]),
+            source_system="dicom",
+            alias_type="patient_folder",
+            alias_value=exam["patient_folder"],
+            raw_value=exam["patient_folder"],
+        )
+    except ValueError:
+        # patient_folder può essere un nome generico (es. "raw") condiviso da più pazienti
+        pass
     if person_key:
         add_subject_alias(
             conn,
@@ -560,6 +566,16 @@ def commit_import_selection(
                     "session_id": session_pk,
                     "subject_pk": subject_pk,
                 })
+
+            # Import RTSTRUCT series (non-blocking: silently skips if NIfTI non ancora pronto)
+            rtstruct_results = find_and_import_rtstruct_series(
+                exam_series=exam["series"],
+                session_id=session_pk,
+                subject_id=internal_subject_id,
+                session_label=exam["timepoint_label"],
+            )
+            if rtstruct_results:
+                result["rtstruct_import"] = result.get("rtstruct_import", []) + rtstruct_results
 
     result["subjects"] = len(seen_subjects)
     result["sessions"] = len(seen_sessions)

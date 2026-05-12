@@ -249,15 +249,20 @@ const WorkspaceView = {
 
     const seqs = data.sequences || [];
     const coreWithRaw = seqs.filter(s => ['T1', 'T1ce', 'T2', 'FLAIR'].includes(s.sequence_type) && s.raw_path);
-    const outputReady = seqs.filter(s => ['T1', 'T1ce', 'T2', 'FLAIR'].includes(s.sequence_type) && s.processed_path).length >= 4;
+    const hasReference = coreWithRaw.some(s => ['T1ce', 'T1'].includes(s.sequence_type));
+    const fetsCapable = ['T1', 'T1ce', 'T2', 'FLAIR'].every(t => coreWithRaw.some(s => s.sequence_type === t));
+    const coreWithProc = seqs.filter(s => ['T1', 'T1ce', 'T2', 'FLAIR'].includes(s.sequence_type) && s.processed_path);
+    const outputReady = coreWithRaw.length > 0 && coreWithRaw.every(s => s.processed_path);
+
+    const prepMode = fetsCapable ? 'FeTS' : (hasReference ? 'SimpleITK (T1ce ref)' : null);
 
     const items = [
       {
         label: 'Serie core',
         detail: coreWithRaw.length
-          ? `${coreWithRaw.length} serie core (${coreWithRaw.map(s => s.sequence_type).join(', ')})`
-          : 'Serie core non complete',
-        status: coreWithRaw.length >= 4 ? 'ok' : 'blocked',
+          ? `${coreWithRaw.length} core (${coreWithRaw.map(s => s.sequence_type).join(', ')}) · modalità: ${prepMode || '—'}`
+          : 'Nessuna serie core con raw_path',
+        status: hasReference ? (fetsCapable ? 'ok' : 'partial') : 'blocked',
         started_at: null,
         finished_at: null,
         duration: '—',
@@ -333,14 +338,16 @@ const WorkspaceView = {
     const coreWithRaw  = seqs.filter(s => CORE.includes(s.sequence_type) && s.raw_path);
     const coreWithProc = seqs.filter(s => CORE.includes(s.sequence_type) && s.processed_path);
     const jobRunning   = jobs.some(j => j.status === 'running');
+    const hasRef       = coreWithRaw.some(s => ['T1ce', 'T1'].includes(s.sequence_type));
+    const fetsOk       = CORE.every(t => coreWithRaw.some(s => s.sequence_type === t));
 
     const nativeStructs = computed.filter(s => s.reference_space === 'native');
     // IMPORT
-    const importOk = coreWithRaw.length >= 2;
+    const importOk = hasRef;
     const importStatus = importOk ? 'ok' : 'blocked';
     const importDetail = importOk
-      ? `${coreWithRaw.length} serie core (${coreWithRaw.map(s => s.sequence_type).join(', ')})`
-      : `Solo ${coreWithRaw.length} serie core con raw_path (min. 2)`;
+      ? `${coreWithRaw.length} serie core (${coreWithRaw.map(s => s.sequence_type).join(', ')}) · ${fetsOk ? 'FeTS' : 'SimpleITK ref=T1ce'}`
+      : `Nessuna sequenza di riferimento (T1ce/T1) con raw_path`;
 
     // PREPROCESSING
     const niiftiDone = stepStatus('nifti_conversion') === 'done';

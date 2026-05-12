@@ -1,6 +1,14 @@
+import shutil
+from pathlib import Path
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from app.db import db, rows_as_dicts
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PREPROCESSED_ROOT = Path("/mnt/dati/irst_data/irst_preprocessed_final")
+STRUCTURES_ROOT   = PROJECT_ROOT / "processed" / "radiological_structures"
+APT_PROCESSED_ROOT = PROJECT_ROOT / "processed" / "imported_sequences"
 from app.services.pipeline_state import sessions_ready_for_phase
 from app.services.structure_metrics import (
     get_signal_metric_job,
@@ -206,4 +214,75 @@ def get_session_structures(session_id: int):
     return {
         "computed":     rows_as_dicts(computed),
         "radiological": rows_as_dicts(radiological),
+    }
+
+
+@router.delete("/sessions/{session_id}")
+def delete_session(session_id: int, delete_subject_if_empty: bool = False):
+    """Elimina una sessione, tutte le sue sequenze, strutture, job e file processati.
+
+    delete_subject_if_empty=true: elimina anche il soggetto se non ha altre sessioni.
+    """
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT ses.id, ses.session_label, ses.processed_dir,
+                   sub.id AS subject_pk, sub.subject_id
+            FROM sessions ses
+            JOIN subjects sub ON sub.id = ses.subject_id
+            WHERE ses.id = ?
+            """,
+            (session_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Session not found")
+
+        subject_id    = row["subject_id"]
+        session_label = row["session_label"]
+        subject_pk    = row["subject_pk"]
+
+        dirs_to_remove: list[Path] = []
+        for base in (
+            PREPROCESSED_ROOT / subject_id / session_label,
+            STRUCTURES_ROOT   / subject_id / session_label,
+            APT_PROCESSED_ROOT / subject_id / session_label,
+        ):
+            if base.exists():
+                dirs_to_remove.append(base)
+
+        if row["processed_dir"]:
+            pd = Path(row["processed_dir"])
+            if pd.exists() and pd not in dirs_to_remove:
+                dirs_to_remove.append(pd)
+
+        removed_dirs: list[str] = []
+        errors: list[str] = []
+        for d in dirs_to_remove:
+            try:
+                shutil.rmtree(d)
+                removed_dirs.append(str(d))
+            except Exception as exc:
+                errors.append(f"{d}: {exc}")
+
+        # CASCADE: sequences, radiological_structures, computed_structures,
+        #          processing_jobs, session_checklist, signal_metric_cache
+        conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+
+        deleted_subject = False
+        if delete_subject_if_empty:
+            remaining = conn.execute(
+                "SELECT COUNT(*) AS n FROM sessions WHERE subject_id = ?",
+                (subject_pk,),
+            ).fetchone()["n"]
+            if remaining == 0:
+                conn.execute("DELETE FROM subjects WHERE id = ?", (subject_pk,))
+                deleted_subject = True
+
+    return {
+        "deleted_session_id": session_id,
+        "subject_id":         subject_id,
+        "session_label":      session_label,
+        "deleted_subject":    deleted_subject,
+        "removed_dirs":       removed_dirs,
+        "errors":             errors,
     }
